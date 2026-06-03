@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "fb657393-e6a9-466b-8719-0bfe8223b331",
+  "name": "SR Minimal HUD",
+  "version": "0.1.0",
+  "author": "Workshop",
+  "description": "Sample interface package for local import testing.",
+  "tags": ["ui", "hud"],
+  "previewImage": null,
+  "assets": [
+    {
+      "source": "assets/hud/layout.bin",
+      "target": "data/menu/hud/layout.bin",
+      "wad": "DATA/Menu.wad.client",
+      "layer": "interface",
+      "sha256": null
+    }
+  ]
+}

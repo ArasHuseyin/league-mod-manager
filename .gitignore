@@ -1,0 +1,26 @@
+# Rust
+/target
+**/target
+
+# Node
+node_modules/
+**/node_modules/
+
+# Build output
+apps/desktop/dist/
+dist/
+
+# Vite / dev logs
+vite.err.log
+vite.out.log
+*.log
+
+# Tauri
+apps/desktop/src-tauri/gen/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

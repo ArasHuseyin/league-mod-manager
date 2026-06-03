@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "1f2f0a77-9648-4f7b-ae09-fd9c76995a12",
+  "name": "Aatrox Crimson VFX",
+  "version": "0.1.0",
+  "author": "Workshop",
+  "description": "Sample mod package for local import testing.",
+  "tags": ["champion", "vfx"],
+  "previewImage": null,
+  "assets": [
+    {
+      "source": "assets/aatrox/vfx.bin",
+      "target": "data/characters/aatrox/skins/skin01/vfx.bin",
+      "wad": "Characters/Aatrox.wad.client",
+      "layer": "vfx",
+      "sha256": null
+    }
+  ]
+}

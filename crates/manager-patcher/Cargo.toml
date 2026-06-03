@@ -1,0 +1,11 @@
+[package]
+name = "manager-patcher"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+manager-core.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+time.workspace = true

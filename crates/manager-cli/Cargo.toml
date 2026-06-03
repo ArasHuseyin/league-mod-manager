@@ -1,0 +1,17 @@
+[package]
+name = "manager-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "manager-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+manager-core.workspace = true
+manager-patcher.workspace = true
+serde_json.workspace = true
+time.workspace = true

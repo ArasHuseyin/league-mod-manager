@@ -1,0 +1,16 @@
+{
+  "name": "league-mod-manager",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter @league-mod-manager/desktop dev",
+    "build": "pnpm --filter @league-mod-manager/desktop build",
+    "tauri:dev": "pnpm --filter @league-mod-manager/desktop tauri:dev",
+    "tauri:build": "pnpm --filter @league-mod-manager/desktop tauri:build",
+    "test": "cargo test --workspace && pnpm --filter @league-mod-manager/desktop test"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}
