@@ -7,7 +7,8 @@ pub mod storage;
 
 pub use league::{detect_league_installations, LeagueInstallation};
 pub use manifest::{
-    load_manifest, ModAsset, ModId, ModManifest, ModPackageKind, ModVersion, ValidationReport,
+    load_manifest, read_package_asset, ModAsset, ModId, ModManifest, ModPackageKind, ModVersion,
+    ValidationReport,
 };
 pub use patch_plan::{build_patch_plan, PatchConflict, PatchOperation, PatchPlan};
 pub use policy::{assess_manifest_policy, PolicyAssessment, PolicyRisk};
