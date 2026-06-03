@@ -40,6 +40,18 @@ Primary package format is `.modpkg`, represented internally by a `manifest.json`
    - Add migration helpers for cslol-/LTK-like folders.
    - Add tray integration, update flow, diagnostics, log viewer, and cache cleanup.
 
+6. Real WAD Writing
+   - Implement reading and writing of League `.wad.client` archives (header, chunk
+     table, compression, and path hashing) behind the existing `PatchEngine` interface.
+   - Build an overlay WAD from a profile's active assets instead of mutating original
+     game files, so the source installation stays untouched.
+   - Keep output directed at a separate staging/output folder first; writing into or
+     mounting against a live League installation is a later, separately evaluated step.
+   - Cover the engine with fixture tests for small synthetic WADs (round-trip read/write,
+     overlay merge, and conflict handling) before any installation-facing behavior.
+   - This phase ships no anti-cheat bypass, injection, or stealth behavior. Live use is
+     the user's responsibility under Riot policy, consistent with Policy and Safety below.
+
 ## Policy and Safety
 
 The current policy is warning-based, not blocking-based. The app should warn about likely paid-skin replicas, premium cosmetic terms, or gameplay-affecting changes. The architecture keeps policy checks centralized so blocking rules can be added later.
@@ -50,6 +62,7 @@ The project must not implement anti-cheat bypass logic, stealth behavior, or ins
 
 - Rust unit tests for manifests, validation, policy assessment, profiles, patch-plan generation, and patcher reports.
 - Fixture tests for `.modpkg` and `.fantome` import once archive parsing exists.
+- Fixture tests for WAD read/write round-trip and overlay merge on small synthetic archives.
 - CLI smoke tests for validate, import, patch dry-run, and doctor.
 - Frontend tests for navigation, library rendering, profile selection, import states, policy warnings, and patch job results.
 - Manual Windows acceptance test: install dependencies, launch app, detect/select League path, import a sample mod, create a profile, run dry-run patch, inspect conflicts/logs.
