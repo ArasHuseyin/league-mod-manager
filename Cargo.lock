@@ -1905,6 +1905,7 @@ dependencies = [
 name = "manager-patcher"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "manager-core",
  "serde",
  "tempfile",
