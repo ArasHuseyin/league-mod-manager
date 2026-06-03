@@ -81,3 +81,112 @@ impl PatchEngine {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use manager_core::{ModAsset, ModManifest};
+    use uuid::Uuid;
+
+    fn library_item(id: Uuid, target: &str) -> LibraryItem {
+        LibraryItem {
+            manifest: ModManifest {
+                schema_version: 1,
+                id,
+                name: format!("Mod {id}"),
+                version: "1.0.0".to_string(),
+                author: "tester".to_string(),
+                description: String::new(),
+                tags: Vec::new(),
+                preview_image: None,
+                assets: vec![ModAsset {
+                    source: "asset.bin".to_string(),
+                    target: target.to_string(),
+                    wad: "Characters/Aatrox.wad.client".to_string(),
+                    layer: None,
+                    sha256: None,
+                }],
+            },
+            package_path: PathBuf::from("."),
+            imported_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    fn profile_with(mods: &[Uuid]) -> Profile {
+        let mut profile = Profile::new("Test");
+        for mod_id in mods {
+            profile.enable_mod(*mod_id);
+        }
+        profile
+    }
+
+    #[test]
+    fn missing_league_root_is_an_error() {
+        let request = PatchRequest {
+            league_root: PathBuf::from("this/path/should/not/exist/zzz"),
+            dry_run: true,
+            profile: Profile::new("Test"),
+            library: Vec::new(),
+        };
+
+        let error = PatchEngine::plan(request).expect_err("missing root should fail");
+        assert!(matches!(error, PatchError::MissingLeagueRoot(_)));
+    }
+
+    #[test]
+    fn dry_run_without_conflicts_is_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let report = PatchEngine::plan(PatchRequest {
+            league_root: dir.path().to_path_buf(),
+            dry_run: true,
+            profile: profile_with(&[id]),
+            library: vec![library_item(id, "skin01.bin")],
+        })
+        .unwrap();
+
+        assert_eq!(report.status, PatchStatus::Ready);
+        assert!(report.dry_run);
+        assert!(report.plan.conflicts.is_empty());
+        assert_eq!(report.plan.operations.len(), 1);
+    }
+
+    #[test]
+    fn conflicting_targets_block_the_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let report = PatchEngine::plan(PatchRequest {
+            league_root: dir.path().to_path_buf(),
+            dry_run: true,
+            profile: profile_with(&[first, second]),
+            library: vec![
+                library_item(first, "same.bin"),
+                library_item(second, "same.bin"),
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(report.status, PatchStatus::Blocked);
+        assert_eq!(report.plan.conflicts.len(), 1);
+    }
+
+    #[test]
+    fn apply_without_conflicts_reports_unimplemented_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let report = PatchEngine::plan(PatchRequest {
+            league_root: dir.path().to_path_buf(),
+            dry_run: false,
+            profile: profile_with(&[id]),
+            library: vec![library_item(id, "skin01.bin")],
+        })
+        .unwrap();
+
+        assert_eq!(report.status, PatchStatus::Applied);
+        assert!(report
+            .messages
+            .iter()
+            .any(|message| message.contains("not implemented")));
+    }
+}

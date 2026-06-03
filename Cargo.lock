@@ -1881,6 +1881,7 @@ dependencies = [
  "manager-core",
  "manager-patcher",
  "serde_json",
+ "tempfile",
  "time",
 ]
 
@@ -1906,8 +1907,10 @@ version = "0.1.0"
 dependencies = [
  "manager-core",
  "serde",
+ "tempfile",
  "thiserror 1.0.69",
  "time",
+ "uuid",
 ]
 
 [[package]]
