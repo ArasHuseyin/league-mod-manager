@@ -13,4 +13,5 @@ pub use manifest::{
 pub use patch_plan::{build_patch_plan, PatchConflict, PatchOperation, PatchPlan};
 pub use policy::{assess_manifest_policy, PolicyAssessment, PolicyRisk};
 pub use profile::{Profile, ProfileId};
-pub use storage::{load_state, save_state, AppPaths, LibraryItem, PersistedState, StorageError};
+pub use storage::{load_state, save_state, import_package, AppPaths, LibraryItem, PersistedState, StorageError};
+

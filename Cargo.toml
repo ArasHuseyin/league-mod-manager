@@ -3,9 +3,13 @@ members = [
   "crates/manager-core",
   "crates/manager-patcher",
   "crates/manager-cli",
+  "crates/manager-injector",
+  "crates/manager-hook-dll",
+  "crates/dummy-loader",
   "apps/desktop/src-tauri"
 ]
 resolver = "2"
+
 
 [workspace.package]
 edition = "2021"
@@ -27,5 +31,11 @@ tauri-build = { version = "2.0", features = [] }
 thiserror = "1.0"
 time = { version = "0.3", features = ["formatting", "macros", "serde"] }
 uuid = { version = "1.10", features = ["serde", "v4"] }
+rfd = "0.14"
 walkdir = "2.5"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+minhook = "0.7"
+windows-sys = "0.59"
+
+
+

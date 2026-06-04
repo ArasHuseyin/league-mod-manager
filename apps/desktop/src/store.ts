@@ -24,7 +24,10 @@ type AppState = {
   importMod: (path: string) => Promise<void>;
   setProfileModEnabled: (modId: string, enabled: boolean) => Promise<void>;
   runDryPatch: () => Promise<void>;
+  selectAndSetLeagueRoot: () => Promise<void>;
+  selectAndImportMod: () => Promise<void>;
 };
+
 
 export const useAppStore = create<AppState>((set, get) => ({
   activeTab: "library",
@@ -153,6 +156,27 @@ export const useAppStore = create<AppState>((set, get) => ({
       });
     } catch (error) {
       set({ loading: false, error: String(error) });
+    }
+  },
+  selectAndSetLeagueRoot: async () => {
+    try {
+      const path = await api.selectDirectory();
+      if (path) {
+        set({ leagueRoot: path });
+        set({ logLines: [...get().logLines, `Selected League path: ${path}`] });
+      }
+    } catch (error) {
+      set({ error: String(error) });
+    }
+  },
+  selectAndImportMod: async () => {
+    try {
+      const path = await api.selectFile();
+      if (path) {
+        await get().importMod(path);
+      }
+    } catch (error) {
+      set({ error: String(error) });
     }
   },
 }));
