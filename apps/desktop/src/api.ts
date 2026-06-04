@@ -84,4 +84,7 @@ export const api = {
     call<Profile>("set_profile_mod_enabled", { profileId, modId, enabled }),
   planPatch: (profileId: string, leagueRoot: string) =>
     call<PatchReport>("plan_patch", { profileId, leagueRoot }),
+  selectDirectory: () => call<string | null>("select_directory", undefined, null),
+  selectFile: () => call<string | null>("select_file", undefined, null),
 };
+

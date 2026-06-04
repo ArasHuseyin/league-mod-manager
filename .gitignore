@@ -24,3 +24,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Local planning notes (not tracked)
+plan.md

@@ -1,5 +1,6 @@
 import React, { useEffect } from "react";
 import { createRoot } from "react-dom/client";
+import { listen } from "@tauri-apps/api/event";
 import {
   AlertTriangle,
   Boxes,
@@ -37,11 +38,37 @@ function App() {
     library,
     profiles,
     selectedProfileId,
+    importMod,
   } = useAppStore();
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    async function setupDragDrop() {
+      try {
+        unlisten = await listen<string[]>("tauri://drag-drop", (event) => {
+          const files = event.payload;
+          if (files && files.length > 0) {
+            for (const file of files) {
+              void importMod(file);
+            }
+          }
+        });
+      } catch (err) {
+        console.warn("Drag-and-drop listener could not be registered:", err);
+      }
+    }
+    void setupDragDrop();
+    return () => {
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [importMod]);
+
 
   const activeProfile = profiles.find((profile) => profile.id === selectedProfileId);
 
@@ -87,8 +114,8 @@ function App() {
             </p>
           </div>
           <button className="primary" onClick={() => void runDryPatch()} disabled={loading}>
-            <Play size={17} />
-            Dry patch
+            {loading ? <span className="spinner" /> : <Play size={17} />}
+            {loading ? "Patching..." : "Dry patch"}
           </button>
         </header>
 
@@ -111,7 +138,7 @@ function App() {
 }
 
 function LibraryView() {
-  const { library, importMod, loading } = useAppStore();
+  const { library, importMod, selectAndImportMod, loading } = useAppStore();
   const [path, setPath] = React.useState("");
   return (
     <>
@@ -130,11 +157,21 @@ function LibraryView() {
             }}
             disabled={loading || !path.trim()}
           >
-            <FileArchive size={17} />
+            {loading ? <span className="spinner" /> : <FileArchive size={17} />}
             Import
+          </button>
+          <button
+            className="secondary"
+            onClick={() => void selectAndImportMod()}
+            disabled={loading}
+          >
+            {loading ? <span className="spinner" /> : <FolderSearch size={17} />}
+            Browse...
           </button>
         </div>
       </section>
+
+
       <section className="content-grid">
         {library.map((item) => (
           <article className="mod-card" key={item.manifest.id}>
@@ -329,7 +366,7 @@ function JobsView() {
 }
 
 function SettingsView() {
-  const { leagueRoot, setLeagueRoot, installations, detectLeague } = useAppStore();
+  const { leagueRoot, setLeagueRoot, selectAndSetLeagueRoot, installations, detectLeague, loading } = useAppStore();
   return (
     <section className="panel">
       <h2>League Installation</h2>
@@ -339,8 +376,12 @@ function SettingsView() {
           onChange={(event) => setLeagueRoot(event.target.value)}
           placeholder="C:\\Riot Games\\League of Legends"
         />
-        <button onClick={() => void detectLeague()}>
-          <FolderSearch size={17} />
+        <button onClick={() => void selectAndSetLeagueRoot()} disabled={loading}>
+          {loading ? <span className="spinner" /> : <FolderSearch size={17} />}
+          Browse...
+        </button>
+        <button className="secondary" onClick={() => void detectLeague()} disabled={loading}>
+          {loading ? <span className="spinner" style={{ marginRight: 6 }} /> : null}
           Detect
         </button>
       </div>

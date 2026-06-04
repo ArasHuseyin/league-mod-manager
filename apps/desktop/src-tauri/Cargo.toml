@@ -17,5 +17,7 @@ manager-patcher.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
+rfd.workspace = true
 time.workspace = true
 uuid.workspace = true
+

@@ -1,0 +1,27 @@
+[package]
+name = "manager-hook-dll"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+name = "manager_hook_dll"
+crate-type = ["cdylib"]
+
+[dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemServices",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_Storage_FileSystem",
+    "Win32_Security"
+] }
+minhook.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+
+
+

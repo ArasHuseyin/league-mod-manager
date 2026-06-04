@@ -1,5 +1,5 @@
 use manager_core::{
-    assess_manifest_policy, detect_league_installations, load_manifest, load_state, save_state,
+    detect_league_installations, import_package, load_state, save_state,
     AppPaths, LibraryItem, ModAsset, ModManifest, PersistedState, Profile,
 };
 use manager_patcher::{PatchEngine, PatchRequest};
@@ -48,18 +48,10 @@ fn detect_league() -> Vec<manager_core::LeagueInstallation> {
 #[tauri::command]
 fn import_mod(path: String, state: tauri::State<AppState>) -> Result<LibraryItem, String> {
     let path_buf = PathBuf::from(path);
-    let manifest = load_manifest(&path_buf).map_err(|error| error.to_string())?;
-    let validation = manifest.validate();
-    if !validation.ok {
-        return Err(validation.errors.join("; "));
-    }
-
-    let _policy = assess_manifest_policy(&manifest);
-    let item = LibraryItem {
-        manifest,
-        package_path: path_buf,
-        imported_at: OffsetDateTime::now_utc(),
+    let Some(paths) = &state.paths else {
+        return Err("App paths are not initialized".to_string());
     };
+    let item = import_package(&path_buf, &paths.packages).map_err(|error| error.to_string())?;
     state.library.lock().expect("library lock").push(item.clone());
     state.persist();
     Ok(item)
@@ -180,6 +172,21 @@ fn seed_profiles() -> Vec<Profile> {
     vec![default, Profile::new("Workshop testing")]
 }
 
+#[tauri::command]
+fn select_directory() -> Option<String> {
+    rfd::FileDialog::new()
+        .pick_folder()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn select_file() -> Option<String> {
+    rfd::FileDialog::new()
+        .add_filter("Mod Package", &["fantome", "zip"])
+        .pick_file()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 /// Load persisted state, or seed first-run demo data and write it to disk.
 fn load_or_seed_state() -> (Option<AppPaths>, PersistedState) {
     let paths = AppPaths::discover();
@@ -232,7 +239,9 @@ pub fn run() {
             import_mod,
             create_profile,
             set_profile_mod_enabled,
-            plan_patch
+            plan_patch,
+            select_directory,
+            select_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
