@@ -19,9 +19,5 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security"
 ] }
 minhook.workspace = true
-serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-
-
-
 

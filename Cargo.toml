@@ -36,6 +36,3 @@ walkdir = "2.5"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 minhook = "0.7"
 windows-sys = "0.59"
-
-
-
