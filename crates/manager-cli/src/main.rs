@@ -20,9 +20,13 @@ enum Command {
     Import { path: PathBuf },
     Patch {
         #[arg(long)]
-        league_root: PathBuf,
-        #[arg(long)]
         manifest: PathBuf,
+        /// Required for a dry run; ignored when --out is given.
+        #[arg(long)]
+        league_root: Option<PathBuf>,
+        /// Build overlay WADs into this directory instead of a dry run.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     Doctor,
 }
@@ -46,28 +50,47 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&(validation, policy))?);
         }
         Command::Patch {
-            league_root,
             manifest,
+            league_root,
+            out,
         } => {
             let manifest_path = manifest;
             let manifest = load_manifest(&manifest_path).context("load manifest")?;
-            let mut profile = Profile::new("CLI dry-run");
+            let mut profile = Profile::new("CLI");
             profile.enable_mod(manifest.id);
             let package_path = manifest_path
                 .parent()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
-            let report = PatchEngine::plan(PatchRequest {
-                league_root,
-                dry_run: true,
-                profile,
-                library: vec![LibraryItem {
-                    manifest,
-                    package_path,
-                    imported_at: OffsetDateTime::now_utc(),
-                }],
-            })?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            let library = vec![LibraryItem {
+                manifest,
+                package_path,
+                imported_at: OffsetDateTime::now_utc(),
+            }];
+
+            match out {
+                Some(out_dir) => {
+                    let request = PatchRequest {
+                        league_root: league_root.unwrap_or_else(|| PathBuf::from(".")),
+                        dry_run: false,
+                        profile,
+                        library,
+                    };
+                    let report = PatchEngine::stage(&request, &out_dir)?;
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+                None => {
+                    let league_root =
+                        league_root.context("--league-root is required for a dry run")?;
+                    let report = PatchEngine::plan(PatchRequest {
+                        league_root,
+                        dry_run: true,
+                        profile,
+                        library,
+                    })?;
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+            }
         }
         Command::Doctor => {
             let installations = detect_league_installations();

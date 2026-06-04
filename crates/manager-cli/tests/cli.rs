@@ -93,6 +93,28 @@ fn patch_produces_a_dry_run_report() {
 }
 
 #[test]
+fn patch_with_out_stages_overlay_wads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = package_dir(tmp.path(), "valid", VALID_MANIFEST);
+    // The manifest references a.bin -> DATA/Menu.wad.client; create that asset.
+    fs::write(dir.join("a.bin"), b"asset-bytes").expect("write asset");
+    let out = tmp.path().join("staging");
+
+    let output = cli()
+        .arg("patch")
+        .arg("--manifest")
+        .arg(dir.join("manifest.json"))
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .expect("run cli");
+
+    assert!(output.status.success(), "stage should succeed");
+    assert!(stdout(&output).contains("\"status\""));
+    assert!(out.join("DATA_Menu.wad.client").exists());
+}
+
+#[test]
 fn doctor_runs_and_emits_json() {
     let output = cli().arg("doctor").output().expect("run cli");
 

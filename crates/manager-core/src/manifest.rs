@@ -284,6 +284,38 @@ fn fantome_assets_from_names(names: &[String]) -> Vec<ModAsset> {
     assets
 }
 
+/// Read the bytes of a single asset from its package, regardless of layout.
+///
+/// For directory packages `source` is resolved relative to the package root;
+/// for `.modpkg`/`.fantome` archives it is the name of an entry inside the zip.
+pub fn read_package_asset(
+    package_path: impl AsRef<Path>,
+    source: &str,
+) -> Result<Vec<u8>, ManifestError> {
+    let package_path = package_path.as_ref();
+    match detect_package_kind(package_path)? {
+        ModPackageKind::Directory => {
+            let asset_path = if package_path.is_dir() {
+                package_path.join(source)
+            } else {
+                package_path
+                    .parent()
+                    .map(|parent| parent.join(source))
+                    .unwrap_or_else(|| Path::new(source).to_path_buf())
+            };
+            Ok(fs::read(asset_path)?)
+        }
+        ModPackageKind::ModPkgArchive | ModPackageKind::FantomeArchive => {
+            let file = fs::File::open(package_path)?;
+            let mut archive = zip::ZipArchive::new(file)?;
+            let mut entry = archive.by_name(source)?;
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }
+    }
+}
+
 pub fn hash_file(path: impl AsRef<Path>) -> Result<String, std::io::Error> {
     let bytes = fs::read(path)?;
     let mut hasher = Sha256::new();
@@ -410,5 +442,35 @@ mod tests {
         assert_eq!(loaded.assets.len(), 1);
         assert_eq!(loaded.assets[0].wad, "Aatrox.wad.client");
         assert!(loaded.validate().ok);
+    }
+
+    #[test]
+    fn reads_asset_bytes_from_directory_package() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let package = dir.path().join("pkg");
+        fs::create_dir_all(package.join("assets")).expect("create assets dir");
+        fs::write(package.join("assets/skin.bin"), b"raw-bytes").expect("write asset");
+
+        let bytes = read_package_asset(&package, "assets/skin.bin").expect("read asset");
+        assert_eq!(bytes, b"raw-bytes");
+    }
+
+    #[test]
+    fn reads_asset_bytes_from_archive_package() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive_path = dir.path().join("pkg.modpkg");
+        let file = fs::File::create(&archive_path).expect("archive file");
+        let mut archive = zip::ZipWriter::new(file);
+        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        archive
+            .start_file("assets/skin.bin", options)
+            .expect("start asset");
+        archive.write_all(b"zip-bytes").expect("write asset");
+        archive.finish().expect("finish archive");
+
+        let bytes = read_package_asset(&archive_path, "assets/skin.bin").expect("read asset");
+        assert_eq!(bytes, b"zip-bytes");
     }
 }
