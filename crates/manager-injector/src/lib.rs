@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
+use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
 use std::thread;
@@ -15,7 +16,8 @@ use windows_sys::Win32::System::Memory::{
 use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows_sys::Win32::System::Threading::{
     CreateRemoteThread, GetExitCodeThread, OpenProcess, WaitForSingleObject, INFINITE,
-    PROCESS_ALL_ACCESS,
+    PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
+    PROCESS_VM_WRITE,
 };
 
 /// Finds the process ID of a process by its executable name (case-insensitive).
@@ -63,13 +65,35 @@ pub fn inject_dll(pid: u32, dll_path: &Path) -> Result<()> {
         .canonicalize()
         .map_err(|e| anyhow!("failed to resolve canonical path of DLL: {e}"))?;
 
+    // `canonicalize` returns a `\\?\` verbatim prefix on Windows; strip it so the
+    // loader normalizes the path as usual.
     let path_str = full_path.to_string_lossy();
-    let c_path_str = CString::new(path_str.as_bytes())?;
-    let path_bytes = c_path_str.as_bytes_with_nul();
+    let clean_path = path_str.strip_prefix(r"\\?\").unwrap_or(path_str.as_ref());
 
-    let process_handle = unsafe { OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid) };
+    // LoadLibraryW expects a UTF-16 path. Using the ANSI LoadLibraryA would corrupt
+    // non-ASCII install paths (e.g. `C:\Users\Hüseyin\...`) because the bytes would be
+    // reinterpreted in the system ANSI code page rather than as UTF-8/UTF-16.
+    let wide_path: Vec<u16> = OsStr::new(clean_path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let wide_bytes = wide_path.len() * std::mem::size_of::<u16>();
+
+    // Request only the rights the injection actually needs (PROCESS_ALL_ACCESS is
+    // both over-privileged and more likely to be denied / flagged).
+    let process_handle = unsafe {
+        OpenProcess(
+            PROCESS_CREATE_THREAD
+                | PROCESS_QUERY_INFORMATION
+                | PROCESS_VM_OPERATION
+                | PROCESS_VM_WRITE
+                | PROCESS_VM_READ,
+            FALSE,
+            pid,
+        )
+    };
     if process_handle.is_null() {
-        return Err(anyhow!("failed to open target process with all access"));
+        return Err(anyhow!("failed to open target process"));
     }
 
     // Allocate memory inside target process for the DLL path string
@@ -77,7 +101,7 @@ pub fn inject_dll(pid: u32, dll_path: &Path) -> Result<()> {
         VirtualAllocEx(
             process_handle,
             ptr::null(),
-            path_bytes.len(),
+            wide_bytes,
             MEM_COMMIT | MEM_RESERVE,
             PAGE_READWRITE,
         )
@@ -93,13 +117,13 @@ pub fn inject_dll(pid: u32, dll_path: &Path) -> Result<()> {
         WriteProcessMemory(
             process_handle,
             remote_mem,
-            path_bytes.as_ptr() as *const _,
-            path_bytes.len(),
+            wide_path.as_ptr() as *const _,
+            wide_bytes,
             &mut bytes_written,
         )
     };
 
-    if write_res == FALSE || bytes_written != path_bytes.len() {
+    if write_res == FALSE || bytes_written != wide_bytes {
         unsafe {
             VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
             CloseHandle(process_handle);
@@ -118,7 +142,7 @@ pub fn inject_dll(pid: u32, dll_path: &Path) -> Result<()> {
         return Err(anyhow!("failed to locate kernel32.dll module"));
     }
 
-    let load_library_name = CString::new("LoadLibraryA")?;
+    let load_library_name = CString::new("LoadLibraryW")?;
     let load_library_addr = unsafe {
         windows_sys::Win32::System::LibraryLoader::GetProcAddress(
             kernel32_handle,
@@ -130,7 +154,7 @@ pub fn inject_dll(pid: u32, dll_path: &Path) -> Result<()> {
             VirtualFreeEx(process_handle, remote_mem, 0, MEM_RELEASE);
             CloseHandle(process_handle);
         }
-        return Err(anyhow!("failed to resolve address of LoadLibraryA"));
+        return Err(anyhow!("failed to resolve address of LoadLibraryW"));
     };
 
     // Create a remote thread that calls LoadLibraryA(remote_mem)
@@ -169,7 +193,7 @@ pub fn inject_dll(pid: u32, dll_path: &Path) -> Result<()> {
     }
 
     if exit_res == FALSE || exit_code == 0 {
-        return Err(anyhow!("LoadLibraryA call in target process returned failure (0)"));
+        return Err(anyhow!("LoadLibraryW call in target process returned failure (0)"));
     }
 
     Ok(())

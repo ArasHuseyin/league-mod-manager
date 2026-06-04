@@ -26,8 +26,8 @@ type AppState = {
   runDryPatch: () => Promise<void>;
   selectAndSetLeagueRoot: () => Promise<void>;
   selectAndImportMod: () => Promise<void>;
+  selectAndImportModDir: () => Promise<void>;
 };
-
 
 export const useAppStore = create<AppState>((set, get) => ({
   activeTab: "library",
@@ -172,6 +172,16 @@ export const useAppStore = create<AppState>((set, get) => ({
   selectAndImportMod: async () => {
     try {
       const path = await api.selectFile();
+      if (path) {
+        await get().importMod(path);
+      }
+    } catch (error) {
+      set({ error: String(error) });
+    }
+  },
+  selectAndImportModDir: async () => {
+    try {
+      const path = await api.selectDirectory();
       if (path) {
         await get().importMod(path);
       }

@@ -20,4 +20,3 @@ tauri.workspace = true
 rfd.workspace = true
 time.workspace = true
 uuid.workspace = true
-
