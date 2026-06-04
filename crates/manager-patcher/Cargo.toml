@@ -10,6 +10,8 @@ serde.workspace = true
 thiserror.workspace = true
 time.workspace = true
 flate2.workspace = true
+zstd.workspace = true
+xxhash-rust.workspace = true
 
 [dev-dependencies]
 tempfile = "3.13"

@@ -1,3 +1,4 @@
+pub mod league_wad;
 pub mod wad;
 
 use manager_core::{

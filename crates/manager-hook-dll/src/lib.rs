@@ -65,7 +65,11 @@ fn init_redirections() {
                 ));
             } else {
                 match std::fs::read_to_string(&config_path) {
-                    Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(content) => match serde_json::from_str::<serde_json::Value>(
+                        // Tolerate a UTF-8 BOM — editors like Notepad add one and
+                        // serde_json otherwise fails with "expected value at line 1".
+                        content.strip_prefix('\u{feff}').unwrap_or(&content),
+                    ) {
                         Ok(parsed) => {
                             if let Some(obj) = parsed.as_object() {
                                 for (key, val) in obj {
