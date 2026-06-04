@@ -69,7 +69,6 @@ function App() {
     };
   }, [importMod]);
 
-
   const activeProfile = profiles.find((profile) => profile.id === selectedProfileId);
 
   return (
@@ -138,7 +137,7 @@ function App() {
 }
 
 function LibraryView() {
-  const { library, importMod, selectAndImportMod, loading } = useAppStore();
+  const { library, importMod, selectAndImportMod, selectAndImportModDir, loading } = useAppStore();
   const [path, setPath] = React.useState("");
   return (
     <>
@@ -164,13 +163,22 @@ function LibraryView() {
             className="secondary"
             onClick={() => void selectAndImportMod()}
             disabled={loading}
+            title="Import a .fantome / .zip archive"
+          >
+            {loading ? <span className="spinner" /> : <FileArchive size={17} />}
+            File...
+          </button>
+          <button
+            className="secondary"
+            onClick={() => void selectAndImportModDir()}
+            disabled={loading}
+            title="Import an unpacked mod folder containing manifest.json"
           >
             {loading ? <span className="spinner" /> : <FolderSearch size={17} />}
-            Browse...
+            Folder...
           </button>
         </div>
       </section>
-
 
       <section className="content-grid">
         {library.map((item) => (
