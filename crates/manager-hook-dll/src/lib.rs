@@ -1,48 +1,92 @@
 use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
-use std::sync::OnceLock;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
-use windows_sys::Win32::Foundation::HANDLE;
+use std::sync::OnceLock;
+use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_SHARE_MODE, FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES
+    CreateFileW, FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE,
 };
+use windows_sys::Win32::System::LibraryLoader::DisableThreadLibraryCalls;
 use windows_sys::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
-use std::os::windows::ffi::OsStrExt;
 
 /// Global configuration for file redirections.
-/// We store the mapping of: Target file path (lowercase string) -> Staged replacement path.
+/// Maps a normalized target suffix (lowercase, `/` separators) -> staged replacement path.
 static REDIRECTION_MAP: OnceLock<std::collections::HashMap<String, PathBuf>> = OnceLock::new();
 
-/// Initialized when the DLL attaches. Reads a config file `redirections.json`
-/// from the directory where the DLL is located.
+/// HINSTANCE of this DLL, captured in `DllMain`.
+static DLL_INSTANCE: OnceLock<isize> = OnceLock::new();
+
+/// Signature of `CreateFileW`. The hook and the stored trampoline must match it exactly.
+type CreateFileWFn = unsafe extern "system" fn(
+    *const u16,
+    u32,
+    FILE_SHARE_MODE,
+    *const windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+    FILE_CREATION_DISPOSITION,
+    FILE_FLAGS_AND_ATTRIBUTES,
+    HANDLE,
+) -> HANDLE;
+
+/// Trampoline to the original `CreateFileW`. Set once during setup before hooks are enabled,
+/// so it can be read concurrently from the hook without `static mut` / data races.
+static ORIGINAL_CREATE_FILE_W: OnceLock<CreateFileWFn> = OnceLock::new();
+
+/// Normalize a path for matching: forward slashes, lowercase.
+fn normalize(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// Append a line to `manager_hook.log` next to the DLL. Best-effort; never panics.
+/// Injected DLLs have no console, so this file is the only way to debug the hook.
+fn log_line(msg: &str) {
+    if let Ok(dir) = get_dll_directory() {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("manager_hook.log"))
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{msg}");
+        }
+    }
+}
+
+/// Reads `redirections.json` from the directory where the DLL is located and builds the map.
 fn init_redirections() {
     let mut map = std::collections::HashMap::new();
 
-    // Look for redirections.json alongside the DLL itself.
-    if let Ok(dll_dir) = get_dll_directory() {
-        let config_path = dll_dir.join("redirections.json");
-        if config_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&config_path) {
-                if let Ok(parsed) = serde_json_from_str::<serde_json::Value>(&content) {
-                    if let Some(obj) = parsed.as_object() {
-                        for (key, val) in obj {
-                            if let Some(val_str) = val.as_str() {
-                                // Store the key in lowercase for case-insensitive lookup
-                                map.insert(key.to_ascii_lowercase(), PathBuf::from(val_str));
+    match get_dll_directory() {
+        Ok(dll_dir) => {
+            let config_path = dll_dir.join("redirections.json");
+            if !config_path.exists() {
+                log_line(&format!(
+                    "no redirections.json found at {}",
+                    config_path.display()
+                ));
+            } else {
+                match std::fs::read_to_string(&config_path) {
+                    Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                        Ok(parsed) => {
+                            if let Some(obj) = parsed.as_object() {
+                                for (key, val) in obj {
+                                    if let Some(val_str) = val.as_str() {
+                                        // Normalize the key exactly like lookups so keys written
+                                        // with backslashes or mixed case still match.
+                                        map.insert(normalize(key), PathBuf::from(val_str));
+                                    }
+                                }
                             }
                         }
-                    }
+                        Err(e) => log_line(&format!("failed to parse redirections.json: {e}")),
+                    },
+                    Err(e) => log_line(&format!("failed to read redirections.json: {e}")),
                 }
             }
         }
+        Err(_) => log_line("failed to resolve DLL directory; no redirections loaded"),
     }
 
     let _ = REDIRECTION_MAP.set(map);
-}
-
-/// Simple JSON parser fallback since we want to keep the DLL lightweight
-fn serde_json_from_str<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, ()> {
-    serde_json::from_str(s).map_err(|_| ())
 }
 
 fn get_dll_directory() -> Result<PathBuf, ()> {
@@ -62,24 +106,21 @@ fn get_dll_directory() -> Result<PathBuf, ()> {
     path.parent().map(|p| p.to_path_buf()).ok_or(())
 }
 
-static DLL_INSTANCE: OnceLock<isize> = OnceLock::new();
-
 fn get_dll_instance_handle() -> isize {
     *DLL_INSTANCE.get().unwrap_or(&0)
 }
 
-// Global reference to call the original CreateFileW function.
-static mut ORIGINAL_CREATE_FILE_W: Option<unsafe extern "system" fn(
-    *const u16,
-    u32,
-    FILE_SHARE_MODE,
-    *const windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
-    FILE_CREATION_DISPOSITION,
-    FILE_FLAGS_AND_ATTRIBUTES,
-    HANDLE
-) -> HANDLE> = None;
+/// Returns true if `path` ends with `key` on a path-component boundary, so
+/// `aatrox.wad.client` does not also match `xaatrox.wad.client`.
+fn suffix_matches(path: &str, key: &str) -> bool {
+    if !path.ends_with(key) {
+        return false;
+    }
+    let prefix_len = path.len() - key.len();
+    prefix_len == 0 || path.as_bytes()[prefix_len - 1] == b'/'
+}
 
-/// Hooked version of CreateFileW. Intercepts calls and redirects paths if they match our redirections.json config.
+/// Hooked version of CreateFileW. Redirects matching paths to staged replacements.
 #[allow(non_snake_case)]
 unsafe extern "system" fn Hook_CreateFileW(
     lp_file_name: *const u16,
@@ -90,33 +131,40 @@ unsafe extern "system" fn Hook_CreateFileW(
     dw_flags_and_attributes: FILE_FLAGS_AND_ATTRIBUTES,
     h_template_file: HANDLE,
 ) -> HANDLE {
-    let original = ORIGINAL_CREATE_FILE_W.expect("original function pointer must be initialized");
+    // The trampoline is always set before hooks are enabled; if somehow missing we cannot
+    // forward the call, so fail the open rather than recurse or panic across the FFI boundary.
+    let Some(&original) = ORIGINAL_CREATE_FILE_W.get() else {
+        return INVALID_HANDLE_VALUE;
+    };
 
     if !lp_file_name.is_null() {
-        // Read wide string into Rust string
-        let mut len = 0;
+        // Read the null-terminated wide string into a Rust string.
+        let mut len = 0isize;
         while *lp_file_name.offset(len) != 0 {
             len += 1;
         }
         let wide_slice = std::slice::from_raw_parts(lp_file_name, len as usize);
         let os_str = OsString::from_wide(wide_slice);
-        let path_str = os_str.to_string_lossy();
-        let normalized_path = path_str.replace('\\', "/").to_ascii_lowercase();
+        let normalized_path = normalize(&os_str.to_string_lossy());
 
         if let Some(map) = REDIRECTION_MAP.get() {
-            // Check if this path (or a sub-path / file name) is mapped for redirection
-            // We search if any key in our redirection map is a suffix of the normalized path.
-            // E.g., if the game opens "C:/Games/LoL/Game/DATA/Menu.wad.client"
-            // and our key is "data/menu.wad.client", we redirect it!
-            if let Some((_, target_path)) = map.iter().find(|(key, _)| normalized_path.ends_with(key.as_str())) {
-                // Redirect! Convert the target replacement path back to wide character string
+            // Redirect if any configured key is a path-boundary suffix of the requested path.
+            // E.g. game opens "C:/Games/LoL/Game/DATA/Menu.wad.client" and the key is
+            // "data/menu.wad.client" -> we point it at the staged replacement instead.
+            if let Some((key, target_path)) = map
+                .iter()
+                .find(|(key, _)| suffix_matches(&normalized_path, key))
+            {
+                log_line(&format!(
+                    "redirecting {normalized_path} -> {} (key: {key})",
+                    target_path.display()
+                ));
                 let wide_target: Vec<u16> = target_path
                     .as_os_str()
                     .encode_wide()
                     .chain(std::iter::once(0))
                     .collect();
 
-                // Call the original CreateFileW with our new redirected path
                 return original(
                     wide_target.as_ptr(),
                     dw_desired_access,
@@ -130,7 +178,7 @@ unsafe extern "system" fn Hook_CreateFileW(
         }
     }
 
-    // Call original function if no match
+    // No match: forward to the original function unchanged.
     original(
         lp_file_name,
         dw_desired_access,
@@ -142,7 +190,25 @@ unsafe extern "system" fn Hook_CreateFileW(
     )
 }
 
-// We use standard library OsStrExt directly for encoding wide strings.
+/// Installs and enables the CreateFileW hook. Runs on a dedicated thread so that no file I/O
+/// or thread-suspending MinHook work happens while the DLL loader lock is held.
+unsafe fn setup_hook() {
+    init_redirections();
+    let count = REDIRECTION_MAP.get().map(|m| m.len()).unwrap_or(0);
+    log_line(&format!("hook DLL attached; {count} redirection(s) loaded"));
+
+    match minhook::MinHook::create_hook(CreateFileW as *mut _, Hook_CreateFileW as *mut _) {
+        Ok(orig) => {
+            let original: CreateFileWFn = std::mem::transmute(orig);
+            let _ = ORIGINAL_CREATE_FILE_W.set(original);
+            match minhook::MinHook::enable_all_hooks() {
+                Ok(_) => log_line("CreateFileW hook enabled"),
+                Err(e) => log_line(&format!("failed to enable hooks: {e:?}")),
+            }
+        }
+        Err(e) => log_line(&format!("failed to create CreateFileW hook: {e:?}")),
+    }
+}
 
 #[no_mangle]
 #[allow(non_snake_case, unused_variables)]
@@ -154,17 +220,11 @@ unsafe extern "system" fn DllMain(
     match fdw_reason {
         DLL_PROCESS_ATTACH => {
             let _ = DLL_INSTANCE.set(hinst_dll);
-            init_redirections();
-
-            // Setup the CreateFileW hook using minhook
-            let original_ptr = minhook::MinHook::create_hook(
-                CreateFileW as *mut _,
-                Hook_CreateFileW as *mut _,
-            );
-            if let Ok(orig) = original_ptr {
-                ORIGINAL_CREATE_FILE_W = Some(std::mem::transmute(orig));
-                let _ = minhook::MinHook::enable_all_hooks();
-            }
+            // We don't need per-thread attach/detach notifications.
+            DisableThreadLibraryCalls(hinst_dll as _);
+            // Defer hook installation off the loader lock: MinHook suspends/enumerates threads
+            // and we touch the filesystem, both of which can deadlock under the lock.
+            std::thread::spawn(|| unsafe { setup_hook() });
         }
         DLL_PROCESS_DETACH => {
             let _ = minhook::MinHook::disable_all_hooks();
@@ -173,4 +233,3 @@ unsafe extern "system" fn DllMain(
     }
     1
 }
-

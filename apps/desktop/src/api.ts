@@ -87,4 +87,3 @@ export const api = {
   selectDirectory: () => call<string | null>("select_directory", undefined, null),
   selectFile: () => call<string | null>("select_file", undefined, null),
 };
-
