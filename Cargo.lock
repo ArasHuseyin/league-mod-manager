@@ -2230,6 +2230,7 @@ dependencies = [
  "flate2",
  "manager-core",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "time",
