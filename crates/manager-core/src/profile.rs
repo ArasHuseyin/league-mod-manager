@@ -35,6 +35,26 @@ impl Profile {
     pub fn disable_mod(&mut self, mod_id: ModId) {
         self.enabled_mods.retain(|enabled| *enabled != mod_id);
     }
+
+    /// Move `mod_id` one step earlier (`up`) or later in the load order. Later
+    /// entries win when two enabled mods write the same asset, so this is how a
+    /// user resolves an overlap in their favor. No-op if the mod is absent or
+    /// already at the relevant end.
+    pub fn move_mod(&mut self, mod_id: ModId, up: bool) {
+        let Some(index) = self.mod_order.iter().position(|id| *id == mod_id) else {
+            return;
+        };
+        let target = if up {
+            index.checked_sub(1)
+        } else if index + 1 < self.mod_order.len() {
+            Some(index + 1)
+        } else {
+            None
+        };
+        if let Some(target) = target {
+            self.mod_order.swap(index, target);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -51,6 +71,29 @@ mod tests {
 
         assert_eq!(profile.enabled_mods, vec![mod_id]);
         assert_eq!(profile.mod_order, vec![mod_id]);
+    }
+
+    #[test]
+    fn move_mod_reorders_within_load_order() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let mut profile = Profile::new("Default");
+        profile.enable_mod(a);
+        profile.enable_mod(b);
+        profile.enable_mod(c);
+
+        profile.move_mod(c, true); // c moves ahead of b -> [a, c, b]
+        assert_eq!(profile.mod_order, vec![a, c, b]);
+
+        profile.move_mod(a, true); // already first -> unchanged
+        assert_eq!(profile.mod_order, vec![a, c, b]);
+
+        profile.move_mod(a, false); // a moves later -> [c, a, b]
+        assert_eq!(profile.mod_order, vec![c, a, b]);
+
+        profile.move_mod(Uuid::new_v4(), true); // unknown id -> no-op
+        assert_eq!(profile.mod_order, vec![c, a, b]);
     }
 
     #[test]

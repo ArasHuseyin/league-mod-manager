@@ -228,6 +228,22 @@ nav button:not(.active):hover {
   margin-top: 18px;
 }
 
+.order-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.hint {
+  color: var(--text-muted);
+  font-size: 13px;
+  margin-top: -4px;
+}
+
+.result-ok {
+  color: var(--primary);
+  font-weight: 600;
+}
+
 h1,
 h2,
 p {

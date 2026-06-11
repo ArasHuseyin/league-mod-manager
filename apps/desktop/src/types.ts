@@ -70,7 +70,15 @@ export type ApplyReport = {
   stagingDir: string;
   stagedFiles: string[];
   redirectionCount: number;
+  matchedOverrides: number;
+  addedEntries: number;
   injectorStarted: boolean;
+  elevated: boolean;
   processName: string;
   messages: string[];
+};
+
+export type InjectorResult = {
+  success: boolean;
+  message: string;
 };

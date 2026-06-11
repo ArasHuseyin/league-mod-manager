@@ -4,8 +4,11 @@ use manager_core::{
 };
 use manager_patcher::{PatchEngine, PatchRequest, PatchStatus};
 use std::process::{Child, Command, Stdio};
-use std::{fs, path::PathBuf, sync::Mutex};
-use tauri::Manager;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
+use std::{fs, path::PathBuf, thread};
+use tauri::{Emitter, Manager};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -28,6 +31,10 @@ struct AppState {
     /// before the next apply and killed on exit — otherwise an injector that is
     /// still waiting for the game would linger as an orphaned process.
     injector: Mutex<Option<Child>>,
+    /// Bumped on every apply. The monitor thread captures the generation it was
+    /// started for and stops quietly once a newer apply supersedes it, so a
+    /// stale monitor never reports for the wrong injector.
+    injector_gen: AtomicU64,
 }
 
 impl AppState {
@@ -143,9 +150,25 @@ pub struct ApplyReport {
     pub staging_dir: String,
     pub staged_files: Vec<String>,
     pub redirection_count: usize,
+    /// Total overrides that matched an existing asset, summed across WADs.
+    pub matched_overrides: usize,
+    /// Total overrides that became new entries because their path did not match.
+    pub added_entries: usize,
     pub injector_started: bool,
+    /// Whether the app is running elevated. Injection into the game requires it;
+    /// when false, the UI warns the run will likely be denied.
+    pub elevated: bool,
     pub process_name: String,
     pub messages: Vec<String>,
+}
+
+/// Payload emitted as `injector-result` once the spawned injector exits, so the
+/// UI learns whether injection actually succeeded instead of only that it started.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InjectorResult {
+    success: bool,
+    message: String,
 }
 
 /// Stage the profile's mods into game-loadable WADs, drop the hook DLL beside the
@@ -161,8 +184,10 @@ pub struct ApplyReport {
 fn apply_patch(
     profile_id: Uuid,
     league_root: String,
+    app: tauri::AppHandle,
     state: tauri::State<AppState>,
 ) -> Result<ApplyReport, String> {
+    let elevated = is_elevated();
     let profile = state
         .profiles
         .lock()
@@ -192,6 +217,8 @@ fn apply_patch(
         .iter()
         .map(|staged| staged.output_path.to_string_lossy().into_owned())
         .collect();
+    let matched_overrides: usize = report.staged.iter().map(|staged| staged.matched_overrides).sum();
+    let added_entries: usize = report.staged.iter().map(|staged| staged.added_entries).sum();
     let mut messages = report.messages.clone();
 
     // Conflicts (or any non-applied status) stop here: nothing was written, so
@@ -202,7 +229,10 @@ fn apply_patch(
             staging_dir: staging_display,
             staged_files,
             redirection_count: 0,
+            matched_overrides,
+            added_entries,
             injector_started: false,
+            elevated,
             process_name: GAME_PROCESS.to_string(),
             messages,
         });
@@ -215,7 +245,10 @@ fn apply_patch(
             staging_dir: staging_display,
             staged_files,
             redirection_count: 0,
+            matched_overrides,
+            added_entries,
             injector_started: false,
+            elevated,
             process_name: GAME_PROCESS.to_string(),
             messages,
         });
@@ -245,8 +278,9 @@ fn apply_patch(
 
     // Reap any injector from a previous apply that is still watching for the game,
     // so repeated applies don't pile up orphaned pollers (each would also try to
-    // inject again once the game starts).
+    // inject again once the game starts), and claim a fresh generation.
     reap_injector(&state);
+    let generation = state.injector_gen.fetch_add(1, Ordering::SeqCst) + 1;
 
     // The injector waits for the game asynchronously, so we cannot block on the
     // eventual injection result here. Capture its output to a log so a later
@@ -268,9 +302,20 @@ fn apply_patch(
         .map_err(|error| format!("failed to start injector: {error}"))?;
     *state.injector.lock().expect("injector lock") = Some(child);
 
+    // Watch the injector in the background and emit `injector-result` when it
+    // exits, so the UI can report real success/failure rather than only that the
+    // injector was armed.
+    spawn_injector_monitor(app, generation, log_path.clone());
+
+    if !elevated {
+        messages.push(
+            "This app is NOT running as Administrator; injection into the game will likely be \
+             denied. Restart it as Administrator before launching League."
+                .to_string(),
+        );
+    }
     messages.push(format!(
         "Injector is watching for {GAME_PROCESS}; launch the game or Practice Tool to apply the mods. \
-         Run this app as Administrator, or injection will be denied. \
          Diagnostics: {}",
         log_path.display()
     ));
@@ -280,10 +325,55 @@ fn apply_patch(
         staging_dir: staging_display,
         staged_files,
         redirection_count,
+        matched_overrides,
+        added_entries,
         injector_started: true,
+        elevated,
         process_name: GAME_PROCESS.to_string(),
         messages,
     })
+}
+
+/// Poll the tracked injector until it exits (or a newer apply supersedes this
+/// `generation`) and emit `injector-result` with the outcome. Runs off-thread so
+/// `apply_patch` can return immediately while the injector waits for the game.
+fn spawn_injector_monitor(app: tauri::AppHandle, generation: u64, log_path: PathBuf) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(500));
+        let state = app.state::<AppState>();
+
+        // A newer apply has taken over; this monitor is stale.
+        if state.injector_gen.load(Ordering::SeqCst) != generation {
+            return;
+        }
+
+        let mut guard = state.injector.lock().expect("injector lock");
+        let status = match guard.as_mut() {
+            Some(child) => child.try_wait(),
+            None => return, // reaped elsewhere
+        };
+        match status {
+            Ok(Some(exit)) => {
+                *guard = None;
+                drop(guard);
+                let success = exit.success();
+                let message = if success {
+                    "Injection succeeded; the mods are now active in the game.".to_string()
+                } else {
+                    format!(
+                        "Injection failed (injector exited with {}). Make sure the app runs as \
+                         Administrator. See {}.",
+                        exit.code().map(|code| code.to_string()).unwrap_or_else(|| "an error".to_string()),
+                        log_path.display()
+                    )
+                };
+                let _ = app.emit("injector-result", InjectorResult { success, message });
+                return;
+            }
+            Ok(None) => {} // still waiting for the game; keep polling
+            Err(_) => return,
+        }
+    });
 }
 
 /// Resolve the staging directory and clear stale output from a previous run.
@@ -323,6 +413,82 @@ fn reap_injector(state: &tauri::State<AppState>) {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+/// Stop a watching injector and clear the staged output. A hook already loaded
+/// into a running game keeps its redirections until the game is restarted, so
+/// this is "disarm + clean", not a live un-patch.
+#[tauri::command]
+fn clear_mods(state: tauri::State<AppState>) -> Result<String, String> {
+    // Bump the generation so any live monitor stops without reporting.
+    state.injector_gen.fetch_add(1, Ordering::SeqCst);
+    reap_injector(&state);
+    let dir = staging_dir(state.paths.as_ref())?;
+    Ok(format!(
+        "Stopped the injector and cleared staged mods ({}). Restart League to return to vanilla.",
+        dir.display()
+    ))
+}
+
+/// Report whether the app is running with the privileges injection needs.
+#[tauri::command]
+fn check_elevation() -> bool {
+    is_elevated()
+}
+
+/// Move a mod earlier or later in a profile's load order; later wins on overlap.
+#[tauri::command]
+fn reorder_profile_mod(
+    profile_id: Uuid,
+    mod_id: Uuid,
+    up: bool,
+    state: tauri::State<AppState>,
+) -> Result<Profile, String> {
+    let mut profiles = state.profiles.lock().expect("profile lock");
+    let profile = profiles
+        .iter_mut()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| "profile not found".to_string())?;
+    profile.move_mod(mod_id, up);
+    let updated = profile.clone();
+    drop(profiles);
+    state.persist();
+    Ok(updated)
+}
+
+/// Whether the current process is running elevated (Administrator). Injecting
+/// into the game requires it; off Windows this is not meaningful, so report true.
+#[cfg(windows)]
+fn is_elevated() -> bool {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut size = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevation as *mut _ as *mut c_void,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut size,
+        );
+        CloseHandle(token);
+        ok != 0 && elevation.TokenIsElevated != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn is_elevated() -> bool {
+    true
 }
 
 /// Count the entries the hook will redirect, for display. Best-effort: a missing
@@ -469,6 +635,7 @@ pub fn run() {
             profiles: Mutex::new(state.profiles),
             paths,
             injector: Mutex::new(None),
+            injector_gen: AtomicU64::new(0),
         })
         .invoke_handler(tauri::generate_handler![
             get_library,
@@ -479,6 +646,9 @@ pub fn run() {
             set_profile_mod_enabled,
             plan_patch,
             apply_patch,
+            clear_mods,
+            check_elevation,
+            reorder_profile_mod,
             select_directory,
             select_file
         ])

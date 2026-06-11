@@ -43,9 +43,13 @@ pub fn build_patch_plan(profile: &Profile, library: &[LibraryItem]) -> PatchPlan
         .map(|item| (item.manifest.id, item))
         .collect::<HashMap<_, _>>();
 
-    let mut operations = Vec::new();
+    // Resolve overlaps by load order: when two enabled mods write the same asset,
+    // the one later in `mod_order` wins (like cslol/LTK), and we record a warning
+    // rather than blocking. Operations keep their first-seen position for a stable,
+    // deterministic plan while their content is replaced by the winner.
+    let mut operations: Vec<PatchOperation> = Vec::new();
+    let mut slot_by_target: HashMap<(String, String), usize> = HashMap::new();
     let mut warnings = Vec::new();
-    let mut targets: HashMap<(String, String), Vec<ModId>> = HashMap::new();
 
     for mod_id in ordered {
         let Some(item) = by_id.get(&mod_id) else {
@@ -54,39 +58,34 @@ pub fn build_patch_plan(profile: &Profile, library: &[LibraryItem]) -> PatchPlan
         };
 
         for asset in &item.manifest.assets {
-            targets
-                .entry((asset.wad.clone(), asset.target.clone()))
-                .or_default()
-                .push(mod_id);
-            operations.push(PatchOperation {
+            let operation = PatchOperation {
                 mod_id,
                 mod_name: item.manifest.name.clone(),
                 source: asset.source.clone(),
                 target: asset.target.clone(),
                 wad: asset.wad.clone(),
-            });
+            };
+            let key = (asset.wad.clone(), asset.target.clone());
+            match slot_by_target.get(&key) {
+                Some(&index) => {
+                    let previous = std::mem::replace(&mut operations[index], operation);
+                    warnings.push(format!(
+                        "\"{}\" overrides \"{}\" on {} in {} (later in load order wins)",
+                        item.manifest.name, previous.mod_name, asset.target, asset.wad
+                    ));
+                }
+                None => {
+                    slot_by_target.insert(key, operations.len());
+                    operations.push(operation);
+                }
+            }
         }
     }
-
-    let conflicts = targets
-        .into_iter()
-        .filter_map(|((wad, target), mod_ids)| {
-            if mod_ids.len() > 1 {
-                Some(PatchConflict {
-                    wad,
-                    target,
-                    mod_ids,
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
 
     PatchPlan {
         profile_id: profile.id,
         operations,
-        conflicts,
+        conflicts: Vec::new(),
         warnings,
     }
 }
@@ -128,7 +127,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_asset_conflicts() {
+    fn overlapping_targets_resolve_by_load_order() {
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
         let mut profile = Profile::new("Default");
@@ -140,7 +139,11 @@ mod tests {
             item(second, "Second", "same.bin"),
         ]);
 
-        assert_eq!(plan.operations.len(), 2);
-        assert_eq!(plan.conflicts.len(), 1);
+        // The later mod wins; the overlap is a warning, not a hard conflict.
+        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.operations.len(), 1);
+        assert_eq!(plan.operations[0].mod_name, "Second");
+        assert_eq!(plan.warnings.len(), 1);
+        assert!(plan.warnings[0].contains("overrides"));
     }
 }
