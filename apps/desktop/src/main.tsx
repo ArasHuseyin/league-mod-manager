@@ -10,6 +10,7 @@ import {
   Library,
   ListChecks,
   Play,
+  Rocket,
   ScrollText,
   Settings,
   ShieldAlert,
@@ -32,14 +33,27 @@ function App() {
     activeTab,
     error,
     loading,
+    applying,
     load,
     setTab,
     runDryPatch,
+    runApplyPatch,
     library,
     profiles,
     selectedProfileId,
     importMod,
   } = useAppStore();
+
+  const confirmAndApply = () => {
+    const message =
+      "Apply mods and start the injector for League of Legends?\n\n" +
+      "This injects a DLL into the running game to redirect WAD files. " +
+      "Modifying League of Legends violates Riot's Terms of Service and can lead to a ban — " +
+      "including in the Practice Tool. Use at your own risk.";
+    if (window.confirm(message)) {
+      void runApplyPatch();
+    }
+  };
 
   useEffect(() => {
     void load();
@@ -112,10 +126,20 @@ function App() {
               {activeProfile ? ` · Active: ${activeProfile.name}` : ""}
             </p>
           </div>
-          <button className="primary" onClick={() => void runDryPatch()} disabled={loading}>
-            {loading ? <span className="spinner" /> : <Play size={17} />}
-            {loading ? "Patching..." : "Dry patch"}
-          </button>
+          <div className="topbar-actions">
+            <button
+              className="secondary"
+              onClick={() => void runDryPatch()}
+              disabled={loading || applying}
+            >
+              {loading ? <span className="spinner" /> : <Play size={17} />}
+              {loading ? "Patching..." : "Dry patch"}
+            </button>
+            <button className="primary" onClick={confirmAndApply} disabled={loading || applying}>
+              {applying ? <span className="spinner" /> : <Rocket size={17} />}
+              {applying ? "Applying..." : "Apply & inject"}
+            </button>
+          </div>
         </header>
 
         {error ? (
@@ -314,9 +338,35 @@ function WorkshopView() {
 }
 
 function JobsView() {
-  const { lastPatchReport } = useAppStore();
+  const { lastPatchReport, lastApplyReport } = useAppStore();
   return (
     <section className="panel">
+      {lastApplyReport ? (
+        <div className="job-report">
+          <h2>Apply &amp; Inject</h2>
+          <div className="metrics">
+            <div>
+              <strong>{lastApplyReport.status}</strong>
+              <span>Status</span>
+            </div>
+            <div>
+              <strong>{lastApplyReport.stagedFiles.length}</strong>
+              <span>Staged files</span>
+            </div>
+            <div>
+              <strong>{lastApplyReport.redirectionCount}</strong>
+              <span>Redirections</span>
+            </div>
+            <div>
+              <strong>{lastApplyReport.injectorStarted ? "armed" : "idle"}</strong>
+              <span>Injector</span>
+            </div>
+          </div>
+          {lastApplyReport.messages.map((message) => (
+            <p key={message}>{message}</p>
+          ))}
+        </div>
+      ) : null}
       <h2>Patch Job</h2>
       {lastPatchReport ? (
         <div className="job-report">

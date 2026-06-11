@@ -2,10 +2,22 @@ use manager_core::{
     detect_league_installations, import_package, load_state, save_state,
     AppPaths, LibraryItem, ModAsset, ModManifest, PersistedState, Profile,
 };
-use manager_patcher::{PatchEngine, PatchRequest};
-use std::{path::PathBuf, sync::Mutex};
+use manager_patcher::{PatchEngine, PatchRequest, PatchStatus};
+use std::process::Command;
+use std::{fs, path::PathBuf, sync::Mutex};
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+/// The League game process that actually loads WAD archives — including in the
+/// Practice Tool and custom games. The hook must be injected here, *not* into
+/// `LeagueClient.exe` (the launcher), or no game asset opens are intercepted.
+const GAME_PROCESS: &str = "League of Legends.exe";
+
+/// Candidate file names for the injected hook DLL, in preference order.
+const HOOK_DLL_NAMES: &[&str] = &["manager_hook_dll.dll"];
+
+/// Candidate file names for the injector binary, in preference order.
+const INJECTOR_NAMES: &[&str] = &["manager-injector.exe", "manager-injector"];
 
 struct AppState {
     library: Mutex<Vec<LibraryItem>>,
@@ -115,6 +127,182 @@ fn plan_patch(
         library: state.library.lock().expect("library lock").clone(),
     })
     .map_err(|error| error.to_string())
+}
+
+/// Result of an apply-and-inject run, surfaced to the UI.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyReport {
+    /// Lowercased patch status: `applied`, `blocked`.
+    pub status: String,
+    pub staging_dir: String,
+    pub staged_files: Vec<String>,
+    pub redirection_count: usize,
+    pub injector_started: bool,
+    pub process_name: String,
+    pub messages: Vec<String>,
+}
+
+/// Stage the profile's mods into game-loadable WADs, drop the hook DLL beside the
+/// generated `redirections.json`, and start the injector watching for the game.
+///
+/// This is the live counterpart to [`plan_patch`]: where the dry run only reports
+/// what *would* change, this writes the patched archives and arms the redirect
+/// hook. The League installation itself is never modified — the hook redirects the
+/// game's file opens to the staged copies. The injector waits for
+/// [`GAME_PROCESS`] and injects once it appears, so it can be armed before or
+/// after the game (or Practice Tool) is launched.
+#[tauri::command]
+fn apply_patch(
+    profile_id: Uuid,
+    league_root: String,
+    state: tauri::State<AppState>,
+) -> Result<ApplyReport, String> {
+    let profile = state
+        .profiles
+        .lock()
+        .expect("profile lock")
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .cloned()
+        .ok_or_else(|| "profile not found".to_string())?;
+    let library = state.library.lock().expect("library lock").clone();
+
+    let staging_dir = staging_dir(state.paths.as_ref())?;
+
+    let report = PatchEngine::stage(
+        &PatchRequest {
+            league_root: PathBuf::from(&league_root),
+            dry_run: false,
+            profile,
+            library,
+        },
+        &staging_dir,
+    )
+    .map_err(|error| error.to_string())?;
+
+    let staging_display = staging_dir.to_string_lossy().into_owned();
+    let staged_files: Vec<String> = report
+        .staged
+        .iter()
+        .map(|staged| staged.output_path.to_string_lossy().into_owned())
+        .collect();
+    let mut messages = report.messages.clone();
+
+    // Conflicts (or any non-applied status) stop here: nothing was written, so
+    // there is nothing to inject.
+    if report.status != PatchStatus::Applied {
+        return Ok(ApplyReport {
+            status: "blocked".to_string(),
+            staging_dir: staging_display,
+            staged_files,
+            redirection_count: 0,
+            injector_started: false,
+            process_name: GAME_PROCESS.to_string(),
+            messages,
+        });
+    }
+
+    if report.staged.is_empty() {
+        messages.push("No mods are enabled in this profile; nothing to inject.".to_string());
+        return Ok(ApplyReport {
+            status: "applied".to_string(),
+            staging_dir: staging_display,
+            staged_files,
+            redirection_count: 0,
+            injector_started: false,
+            process_name: GAME_PROCESS.to_string(),
+            messages,
+        });
+    }
+
+    let redirection_count = count_redirections(&staging_dir);
+
+    // The hook reads `redirections.json` from its own directory, so the DLL must
+    // live next to the staged output.
+    let dll_src = resolve_tool("LEAGUE_MOD_MANAGER_HOOK_DLL", HOOK_DLL_NAMES).ok_or_else(|| {
+        "could not locate the hook DLL (manager_hook_dll.dll) next to the app; \
+         build it with `cargo build -p manager-hook-dll` or set LEAGUE_MOD_MANAGER_HOOK_DLL"
+            .to_string()
+    })?;
+    let dll_name = dll_src
+        .file_name()
+        .map(|name| name.to_owned())
+        .ok_or_else(|| "hook DLL path has no file name".to_string())?;
+    let dll_dst = staging_dir.join(&dll_name);
+    fs::copy(&dll_src, &dll_dst).map_err(|error| format!("failed to copy hook DLL: {error}"))?;
+
+    let injector = resolve_tool("LEAGUE_MOD_MANAGER_INJECTOR", INJECTOR_NAMES).ok_or_else(|| {
+        "could not locate the injector (manager-injector) next to the app; \
+         build it with `cargo build -p manager-injector` or set LEAGUE_MOD_MANAGER_INJECTOR"
+            .to_string()
+    })?;
+
+    Command::new(&injector)
+        .arg(GAME_PROCESS)
+        .arg(&dll_dst)
+        .spawn()
+        .map_err(|error| format!("failed to start injector: {error}"))?;
+
+    messages.push(format!(
+        "Injector is watching for {GAME_PROCESS}; launch the game or Practice Tool to apply the mods."
+    ));
+
+    Ok(ApplyReport {
+        status: "applied".to_string(),
+        staging_dir: staging_display,
+        staged_files,
+        redirection_count,
+        injector_started: true,
+        process_name: GAME_PROCESS.to_string(),
+        messages,
+    })
+}
+
+/// Resolve the staging directory and ensure it starts empty, so stale overlays
+/// or redirections from a previous profile never linger.
+fn staging_dir(paths: Option<&AppPaths>) -> Result<PathBuf, String> {
+    let base = match paths {
+        Some(paths) => paths.cache.clone(),
+        None => std::env::temp_dir().join("league-mod-manager"),
+    };
+    let dir = base.join("overlay");
+    if dir.exists() {
+        fs::remove_dir_all(&dir)
+            .map_err(|error| format!("failed to clear staging dir {}: {error}", dir.display()))?;
+    }
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("failed to create staging dir {}: {error}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Count the entries the hook will redirect, for display. Best-effort: a missing
+/// or unreadable file simply reports zero.
+fn count_redirections(staging_dir: &std::path::Path) -> usize {
+    fs::read(staging_dir.join("redirections.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value.as_object().map(|map| map.len()))
+        .unwrap_or(0)
+}
+
+/// Find a bundled helper binary: an explicit env override wins, otherwise look
+/// beside the running executable. In a workspace dev build every crate shares
+/// one `target/` directory, so the injector and DLL sit next to the app there;
+/// in a packaged build they ship as sidecars in the same folder.
+fn resolve_tool(env_key: &str, names: &[&str]) -> Option<PathBuf> {
+    if let Some(override_path) = std::env::var_os(env_key) {
+        let path = PathBuf::from(override_path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(PathBuf::from))?;
+    names
+        .iter()
+        .map(|name| exe_dir.join(name))
+        .find(|candidate| candidate.exists())
 }
 
 fn seed_library() -> Vec<LibraryItem> {
@@ -240,6 +428,7 @@ pub fn run() {
             create_profile,
             set_profile_mod_enabled,
             plan_patch,
+            apply_patch,
             select_directory,
             select_file
         ])

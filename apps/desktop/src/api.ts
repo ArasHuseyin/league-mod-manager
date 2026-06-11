@@ -1,5 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { LeagueInstallation, LibraryItem, PatchReport, Profile } from "./types";
+import type {
+  ApplyReport,
+  LeagueInstallation,
+  LibraryItem,
+  PatchReport,
+  Profile,
+} from "./types";
 
 const demoLibrary: LibraryItem[] = [
   {
@@ -84,6 +90,8 @@ export const api = {
     call<Profile>("set_profile_mod_enabled", { profileId, modId, enabled }),
   planPatch: (profileId: string, leagueRoot: string) =>
     call<PatchReport>("plan_patch", { profileId, leagueRoot }),
+  applyPatch: (profileId: string, leagueRoot: string) =>
+    call<ApplyReport>("apply_patch", { profileId, leagueRoot }),
   selectDirectory: () => call<string | null>("select_directory", undefined, null),
   selectFile: () => call<string | null>("select_file", undefined, null),
 };

@@ -1,6 +1,12 @@
 import { create } from "zustand";
 import { api } from "./api";
-import type { LeagueInstallation, LibraryItem, PatchReport, Profile } from "./types";
+import type {
+  ApplyReport,
+  LeagueInstallation,
+  LibraryItem,
+  PatchReport,
+  Profile,
+} from "./types";
 
 type AppTab = "library" | "profiles" | "workshop" | "jobs" | "settings" | "logs";
 
@@ -12,8 +18,10 @@ type AppState = {
   selectedProfileId?: string;
   leagueRoot: string;
   lastPatchReport?: PatchReport;
+  lastApplyReport?: ApplyReport;
   logLines: string[];
   loading: boolean;
+  applying: boolean;
   error?: string;
   setTab: (tab: AppTab) => void;
   setLeagueRoot: (root: string) => void;
@@ -24,6 +32,7 @@ type AppState = {
   importMod: (path: string) => Promise<void>;
   setProfileModEnabled: (modId: string, enabled: boolean) => Promise<void>;
   runDryPatch: () => Promise<void>;
+  runApplyPatch: () => Promise<void>;
   selectAndSetLeagueRoot: () => Promise<void>;
   selectAndImportMod: () => Promise<void>;
   selectAndImportModDir: () => Promise<void>;
@@ -37,6 +46,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   leagueRoot: "",
   logLines: ["App shell initialized."],
   loading: false,
+  applying: false,
   setTab: (activeTab) => set({ activeTab }),
   setLeagueRoot: (leagueRoot) => set({ leagueRoot }),
   setSelectedProfile: (selectedProfileId) => set({ selectedProfileId }),
@@ -156,6 +166,35 @@ export const useAppStore = create<AppState>((set, get) => ({
       });
     } catch (error) {
       set({ loading: false, error: String(error) });
+    }
+  },
+  runApplyPatch: async () => {
+    const { selectedProfileId, leagueRoot } = get();
+    if (!selectedProfileId) {
+      set({ error: "Select a profile before applying mods." });
+      return;
+    }
+    if (!leagueRoot.trim()) {
+      set({ error: "Set the League installation path before applying mods." });
+      return;
+    }
+
+    set({ applying: true, error: undefined });
+    try {
+      const report = await api.applyPatch(selectedProfileId, leagueRoot);
+      set({
+        applying: false,
+        lastApplyReport: report,
+        activeTab: "jobs",
+        logLines: [
+          ...get().logLines,
+          report.injectorStarted
+            ? `Applied ${report.stagedFiles.length} file(s) with ${report.redirectionCount} redirection(s); injector watching for ${report.processName}.`
+            : `Apply finished with status ${report.status}: ${report.messages.join(" ")}`,
+        ],
+      });
+    } catch (error) {
+      set({ applying: false, error: String(error) });
     }
   },
   selectAndSetLeagueRoot: async () => {

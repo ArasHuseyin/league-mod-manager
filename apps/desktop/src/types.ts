@@ -64,3 +64,13 @@ export type LeagueInstallation = {
   gameExecutable: string;
   source: string;
 };
+
+export type ApplyReport = {
+  status: "applied" | "blocked";
+  stagingDir: string;
+  stagedFiles: string[];
+  redirectionCount: number;
+  injectorStarted: boolean;
+  processName: string;
+  messages: string[];
+};
