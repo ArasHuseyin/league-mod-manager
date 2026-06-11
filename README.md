@@ -61,18 +61,28 @@ cargo test --workspace                                 # run all Rust tests
 ```
 
 The injector and hook DLL are Windows-only and must be built before the
-**Apply & inject** button can run:
+**Apply & inject** button can run. The app looks for them next to its own
+executable, so build them with the **same profile** as the app you run — debug
+for `tauri:dev`, release for `tauri build`:
 
 ```powershell
+# For `tauri:dev` (debug app at target\debug):
+cargo build -p manager-injector -p manager-hook-dll
+
+# For a release build:
 cargo build --release -p manager-injector -p manager-hook-dll
 ```
 
-In a workspace dev build every crate shares one `target/` directory, so the app
-finds `manager-injector.exe` and `manager_hook_dll.dll` next to itself
-automatically. In a packaged build, ship them as sidecars in the same folder.
-You can also point the app at explicit paths with the
+Because the whole workspace shares one `target\` directory, a same-profile build
+drops `manager-injector.exe` and `manager_hook_dll.dll` right next to the app. In
+a packaged build, ship them as sidecars in the same folder. To avoid the
+profile/location dance entirely, point the app at explicit paths with the
 `LEAGUE_MOD_MANAGER_INJECTOR` and `LEAGUE_MOD_MANAGER_HOOK_DLL` environment
 variables.
+
+> [!IMPORTANT]
+> Start the app (or your dev terminal) **as Administrator** — injecting into the
+> game requires it.
 
 ## Desktop workflow
 
