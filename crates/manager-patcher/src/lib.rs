@@ -10,7 +10,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
-use wad::{Compression, WadBuilder};
+
+/// Sentinel `wad` value for raw, non-archived files dropped directly into the
+/// game folder (Fantome `RAW/` entries). These are redirected by their target
+/// path rather than patched into a WAD.
+const RAW_WAD: &str = "RAW";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -114,11 +118,26 @@ impl PatchEngine {
         })
     }
 
-    /// Build overlay WAD archives for a profile's active mods and write them to
-    /// `staging_dir`. This never touches the League installation: each target
-    /// WAD becomes a separate overlay file containing only the modded assets.
-    /// Plans with conflicts are refused and nothing is written.
+    /// Stage a profile's active mods into game-loadable files plus a
+    /// `redirections.json` the hook DLL consumes at runtime.
+    ///
+    /// For every target WAD this locates the *real* archive inside the League
+    /// installation, applies the mod's overrides and additions with
+    /// [`league_wad::patch_or_add_wad`], and writes the full patched archive to
+    /// `staging_dir`. Because the original archive is kept whole, the game still
+    /// finds every untouched asset — only the modded entries change. Raw
+    /// (`RAW/`) files are copied verbatim and redirected by their target path.
+    ///
+    /// The live installation is never modified: the hook redirects the game's
+    /// file opens to these staged copies via `redirections.json`. Plans with
+    /// conflicts are refused and nothing is written.
     pub fn stage(request: &PatchRequest, staging_dir: &Path) -> Result<StageReport, PatchError> {
+        if !request.league_root.exists() {
+            return Err(PatchError::MissingLeagueRoot(
+                request.league_root.display().to_string(),
+            ));
+        }
+
         let plan = build_patch_plan(&request.profile, &request.library);
 
         if !plan.conflicts.is_empty() {
@@ -126,7 +145,7 @@ impl PatchEngine {
                 status: PatchStatus::Blocked,
                 staged: Vec::new(),
                 plan,
-                messages: vec!["Patch plan has conflicts; no overlays were written.".to_string()],
+                messages: vec!["Patch plan has conflicts; nothing was written.".to_string()],
             });
         }
 
@@ -145,21 +164,74 @@ impl PatchEngine {
 
         fs::create_dir_all(staging_dir)?;
 
+        let read_asset = |operation: &PatchOperation| -> Result<Vec<u8>, PatchError> {
+            let item = by_id.get(&operation.mod_id).ok_or_else(|| {
+                PatchError::Stage(format!("mod {} is missing from the library", operation.mod_id))
+            })?;
+            read_package_asset(&item.package_path, &operation.source)
+                .map_err(|error| PatchError::Stage(format!("{}: {error}", operation.source)))
+        };
+
         let mut staged = Vec::new();
+        let mut messages = Vec::new();
+        // Normalized suffix of the game's file open -> absolute staged replacement.
+        let mut redirections: BTreeMap<String, String> = BTreeMap::new();
+
         for (wad, operations) in groups {
-            let mut builder = WadBuilder::new();
-            for operation in &operations {
-                let item = by_id.get(&operation.mod_id).ok_or_else(|| {
-                    PatchError::Stage(format!("mod {} is missing from the library", operation.mod_id))
-                })?;
-                let bytes = read_package_asset(&item.package_path, &operation.source)
-                    .map_err(|error| PatchError::Stage(format!("{}: {error}", operation.source)))?;
-                builder.add(&operation.target, bytes, Compression::Gzip);
+            if wad == RAW_WAD {
+                for operation in &operations {
+                    let bytes = read_asset(operation)?;
+                    let output_path = staging_dir.join(overlay_file_name(&operation.target));
+                    fs::write(&output_path, &bytes)?;
+                    redirections.insert(
+                        normalize_key(&operation.target),
+                        absolute_string(&output_path),
+                    );
+                    staged.push(StagedWad {
+                        wad: RAW_WAD.to_string(),
+                        output_path,
+                        entry_count: 1,
+                    });
+                }
+                continue;
             }
 
+            // Locate the real archive in the installation so the patch keeps every
+            // untouched asset. Without it we cannot produce a loadable WAD, so we
+            // skip this target and report it rather than ship a broken overlay.
+            let Some(real_wad) = find_game_wad(&request.league_root, &wad) else {
+                messages.push(format!(
+                    "could not find '{wad}' under {}; skipped",
+                    request.league_root.display()
+                ));
+                continue;
+            };
+
+            let original = fs::read(&real_wad)?;
+            let payloads: Vec<(u64, Vec<u8>)> = operations
+                .iter()
+                .map(|operation| Ok((league_wad::path_hash(&operation.target), read_asset(operation)?)))
+                .collect::<Result<_, PatchError>>()?;
+            let overrides: Vec<(u64, &[u8])> = payloads
+                .iter()
+                .map(|(hash, bytes)| (*hash, bytes.as_slice()))
+                .collect();
+
+            let patched = league_wad::patch_or_add_wad(&original, &overrides)
+                .map_err(|error| PatchError::Stage(format!("{wad}: {error}")))?;
+
             let output_path = staging_dir.join(overlay_file_name(&wad));
-            let mut file = fs::File::create(&output_path)?;
-            builder.write(&mut file)?;
+            fs::write(&output_path, &patched)?;
+
+            // Key the redirection on the archive's path relative to the install
+            // root: that is an unambiguous, path-boundary suffix of whatever
+            // absolute path the game passes to CreateFileW.
+            let key = real_wad
+                .strip_prefix(&request.league_root)
+                .map(normalize_path)
+                .unwrap_or_else(|_| normalize_key(&wad));
+            redirections.insert(key, absolute_string(&output_path));
+
             staged.push(StagedWad {
                 wad,
                 output_path,
@@ -167,10 +239,19 @@ impl PatchEngine {
             });
         }
 
-        let messages = vec![format!(
-            "Wrote {} overlay WAD(s) to staging. The live League installation was not modified.",
-            staged.len()
-        )];
+        // Write the config the hook DLL reads to know what to redirect at runtime.
+        let redirections_path = staging_dir.join("redirections.json");
+        fs::write(
+            &redirections_path,
+            serde_json::to_vec_pretty(&redirections)
+                .map_err(|error| PatchError::Stage(error.to_string()))?,
+        )?;
+
+        messages.push(format!(
+            "Staged {} file(s) and {} redirection(s); the live League installation was not modified.",
+            staged.len(),
+            redirections.len()
+        ));
 
         Ok(StageReport {
             status: PatchStatus::Applied,
@@ -184,6 +265,68 @@ impl PatchEngine {
 /// Map a WAD path to a flat, collision-free staging file name.
 fn overlay_file_name(wad: &str) -> String {
     wad.replace(['/', '\\'], "_")
+}
+
+/// Normalize a path the same way the hook DLL does for matching: forward
+/// slashes, lowercase.
+fn normalize_path(path: &Path) -> String {
+    normalize_key(&path.to_string_lossy())
+}
+
+fn normalize_key(value: &str) -> String {
+    value.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn absolute_string(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .to_string()
+}
+
+/// Find a real `.wad.client` archive in a League installation by file name.
+///
+/// The manifest's `wad` field carries a logical path (e.g.
+/// `Characters/Aatrox.wad.client`) whose folder need not match the on-disk
+/// layout (`Game/DATA/FINAL/Champions/...`), so we match on the final path
+/// component — WAD file names are unique within an install.
+fn find_game_wad(league_root: &Path, wad: &str) -> Option<PathBuf> {
+    let file_name = wad
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(wad)
+        .to_ascii_lowercase();
+
+    // Real archives live under the `Game` subtree; fall back to the whole root.
+    let game_dir = league_root.join("Game");
+    let search_root = if game_dir.is_dir() { game_dir } else { league_root.to_path_buf() };
+    find_file_named(&search_root, &file_name)
+}
+
+/// Depth-first search for a file whose name equals `target` (case-insensitive).
+fn find_file_named(dir: &Path, target: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            subdirs.push(path);
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.eq_ignore_ascii_case(target))
+            .unwrap_or(false)
+        {
+            return Some(path);
+        }
+    }
+    for subdir in subdirs {
+        if let Some(found) = find_file_named(&subdir, target) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -294,12 +437,52 @@ mod tests {
             .any(|message| message.contains("not implemented")));
     }
 
+    /// Build a minimal real WAD v3 archive of Raw `(in-wad path, bytes)` entries,
+    /// matching the on-disk layout `league_wad` parses.
+    fn build_real_wad(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use league_wad::{ENTRY_LEN, HEADER_LEN, MAGIC};
+        let count = entries.len();
+        let toc_end = HEADER_LEN + count * ENTRY_LEN;
+        let mut buf = vec![0u8; toc_end];
+        buf[0..2].copy_from_slice(&MAGIC);
+        buf[2] = 3; // major
+        buf[3] = 4; // minor
+        buf[4 + 256 + 8..4 + 256 + 12].copy_from_slice(&(count as u32).to_le_bytes());
+
+        let mut cursor = toc_end as u64;
+        for (i, (path, data)) in entries.iter().enumerate() {
+            let base = HEADER_LEN + i * ENTRY_LEN;
+            buf[base..base + 8].copy_from_slice(&league_wad::path_hash(path).to_le_bytes());
+            buf[base + 8..base + 12].copy_from_slice(&(cursor as u32).to_le_bytes());
+            buf[base + 12..base + 16].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            buf[base + 16..base + 20].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            buf[base + 20] = 0; // Raw
+            buf.extend_from_slice(data);
+            cursor += data.len() as u64;
+        }
+        buf
+    }
+
     #[test]
-    fn stage_writes_an_overlay_wad_per_target() {
+    fn stage_patches_the_real_wad_and_writes_redirections() {
         let dir = tempfile::tempdir().unwrap();
+
+        // A real installation archive with one original asset we will override and
+        // one untouched asset that must survive the patch.
+        let target = "data/characters/aatrox/skin01.bin";
+        let real_wad = build_real_wad(&[
+            (target, b"original-skin"),
+            ("data/characters/aatrox/base.bin", b"keep-me"),
+        ]);
+        let wad_dir = dir.path().join("Game/DATA/FINAL/Champions");
+        std::fs::create_dir_all(&wad_dir).unwrap();
+        let wad_path = wad_dir.join("Aatrox.wad.client");
+        std::fs::write(&wad_path, &real_wad).unwrap();
+
+        // A mod package that overrides the skin asset.
         let package = dir.path().join("pkg");
         std::fs::create_dir_all(package.join("assets")).unwrap();
-        std::fs::write(package.join("assets/skin.bin"), b"skin-bytes").unwrap();
+        std::fs::write(package.join("assets/skin.bin"), b"modded-skin-bytes").unwrap();
 
         let id = Uuid::new_v4();
         let item = LibraryItem {
@@ -314,7 +497,7 @@ mod tests {
                 preview_image: None,
                 assets: vec![ModAsset {
                     source: "assets/skin.bin".to_string(),
-                    target: "data/characters/aatrox/skin01.bin".to_string(),
+                    target: target.to_string(),
                     wad: "Characters/Aatrox.wad.client".to_string(),
                     layer: None,
                     sha256: None,
@@ -339,18 +522,81 @@ mod tests {
         assert_eq!(report.status, PatchStatus::Applied);
         assert_eq!(report.staged.len(), 1);
         let staged = &report.staged[0];
-        assert_eq!(staged.entry_count, 1);
-        assert!(staged.output_path.exists());
         assert_eq!(staged.output_path.file_name().unwrap(), "Characters_Aatrox.wad.client");
 
+        // The staged file is a real, loadable WAD v3: the override resolves to the
+        // mod bytes while the untouched asset still resolves to its original bytes.
         let bytes = std::fs::read(&staged.output_path).unwrap();
-        let entries = wad::read_wad(&bytes).unwrap();
-        assert_eq!(entries.len(), 1);
+        let parsed = league_wad::WadV3::parse(&bytes).unwrap();
+        let overridden = parsed.find_path(target).unwrap();
         assert_eq!(
-            entries[0].path_hash,
-            wad::path_hash("data/characters/aatrox/skin01.bin")
+            league_wad::decode_chunk(&bytes, overridden).unwrap(),
+            b"modded-skin-bytes"
         );
-        assert_eq!(entries[0].data, b"skin-bytes");
+        let kept = parsed.find_path("data/characters/aatrox/base.bin").unwrap();
+        assert_eq!(league_wad::decode_chunk(&bytes, kept).unwrap(), b"keep-me");
+
+        // The hook config points the game's open of the real archive at the staged copy.
+        let redirections: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(staging.join("redirections.json")).unwrap())
+                .unwrap();
+        let map = redirections.as_object().unwrap();
+        assert_eq!(map.len(), 1);
+        let (key, value) = map.iter().next().unwrap();
+        assert_eq!(key, "game/data/final/champions/aatrox.wad.client");
+        assert!(value.as_str().unwrap().ends_with("Characters_Aatrox.wad.client"));
+    }
+
+    #[test]
+    fn stage_redirects_raw_files_by_target_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("pkg");
+        std::fs::create_dir_all(package.join("RAW/DATA")).unwrap();
+        std::fs::write(package.join("RAW/DATA/config.bin"), b"raw-bytes").unwrap();
+
+        let id = Uuid::new_v4();
+        let item = LibraryItem {
+            manifest: ModManifest {
+                schema_version: 1,
+                id,
+                name: "Raw".to_string(),
+                version: "1.0.0".to_string(),
+                author: "tester".to_string(),
+                description: String::new(),
+                tags: Vec::new(),
+                preview_image: None,
+                assets: vec![ModAsset {
+                    source: "RAW/DATA/config.bin".to_string(),
+                    target: "DATA/config.bin".to_string(),
+                    wad: "RAW".to_string(),
+                    layer: Some("raw".to_string()),
+                    sha256: None,
+                }],
+            },
+            package_path: package,
+            imported_at: OffsetDateTime::UNIX_EPOCH,
+        };
+
+        let staging = dir.path().join("staging");
+        let report = PatchEngine::stage(
+            &PatchRequest {
+                league_root: dir.path().to_path_buf(),
+                dry_run: true,
+                profile: profile_with(&[id]),
+                library: vec![item],
+            },
+            &staging,
+        )
+        .unwrap();
+
+        assert_eq!(report.status, PatchStatus::Applied);
+        assert_eq!(report.staged.len(), 1);
+        assert_eq!(std::fs::read(&report.staged[0].output_path).unwrap(), b"raw-bytes");
+
+        let redirections: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(staging.join("redirections.json")).unwrap())
+                .unwrap();
+        assert!(redirections.as_object().unwrap().contains_key("data/config.bin"));
     }
 
     #[test]

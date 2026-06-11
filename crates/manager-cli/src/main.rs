@@ -71,7 +71,8 @@ fn main() -> Result<()> {
             match out {
                 Some(out_dir) => {
                     let request = PatchRequest {
-                        league_root: league_root.unwrap_or_else(|| PathBuf::from(".")),
+                        league_root: league_root
+                            .context("--league-root is required when staging with --out")?,
                         dry_run: false,
                         profile,
                         library,

@@ -24,6 +24,7 @@
 //! ```
 //! Compression types: 0 Raw, 1 Gzip, 2 Link, 3 Zstd, 4 ZstdChunked.
 
+use std::collections::HashMap;
 use std::io::Read;
 
 use flate2::read::GzDecoder;
@@ -248,6 +249,112 @@ pub fn patch_wad(original: &[u8], overrides: &[(u64, &[u8])]) -> Result<Vec<u8>,
     Ok(out)
 }
 
+/// Produce a patched copy of a real WAD that both *overrides* existing chunks and
+/// *adds* brand-new ones, keyed by path hash.
+///
+/// This is the superset of [`patch_wad`]: a path hash already present in the
+/// archive is overridden in place (append-and-repoint), while a path hash the
+/// archive does not contain is appended as a new `Raw` entry with a fresh table
+/// slot. Real skin mods routinely ship new files (extra textures, animations a
+/// rewritten `.bin` references), so rejecting unknown hashes — as `patch_wad`
+/// does — would silently drop those assets and leave the skin broken in game.
+///
+/// The grown table of contents shifts every original payload right by
+/// `additions * ENTRY_LEN`; each untouched entry keeps its bytes verbatim with
+/// only its absolute `dataOffset` re-based, so `ZstdChunked` subchunk metadata
+/// and every other field stay valid. The header's signature and checksum bytes
+/// are preserved verbatim, matching [`patch_wad`].
+pub fn patch_or_add_wad(original: &[u8], entries: &[(u64, &[u8])]) -> Result<Vec<u8>, WadV3Error> {
+    let wad = WadV3::parse(original)?;
+    let original_count = wad.chunks.len();
+    let original_toc_end = HEADER_LEN + original_count * ENTRY_LEN;
+
+    // Split requested entries into overrides (hash already present) and additions
+    // (hash absent). De-duplicate additions so a hash is only added once.
+    let mut overrides: HashMap<u64, &[u8]> = HashMap::new();
+    let mut additions: Vec<(u64, &[u8])> = Vec::new();
+    for (hash, content) in entries {
+        if wad.chunks.iter().any(|chunk| chunk.path_hash == *hash) {
+            overrides.insert(*hash, *content);
+        } else if !additions.iter().any(|(existing, _)| existing == hash) {
+            additions.push((*hash, *content));
+        }
+    }
+
+    let new_count = original_count + additions.len();
+    let new_toc_end = HEADER_LEN + new_count * ENTRY_LEN;
+    // How far the table of contents grew; every original payload offset shifts by this.
+    let delta = u32::try_from(new_toc_end - original_toc_end).map_err(|_| WadV3Error::Truncated)?;
+
+    let original_payload = &original[original_toc_end..];
+
+    // Header verbatim, then a (zeroed) grown TOC, then the shifted original payload.
+    let mut out = Vec::with_capacity(original.len() + delta as usize);
+    out.extend_from_slice(&original[..HEADER_LEN]);
+    let count_at = 4 + SIGNATURE_LEN + 8;
+    out[count_at..count_at + 4].copy_from_slice(&(new_count as u32).to_le_bytes());
+    out.resize(new_toc_end, 0);
+    out.extend_from_slice(original_payload);
+
+    // The appended region begins right after the shifted original payload. Lay out
+    // every overridden and added payload there and remember each absolute offset.
+    let mut appended: Vec<u8> = Vec::new();
+    let mut cursor = out.len() as u64;
+    let mut override_slot: HashMap<u64, (u32, u32, u64)> = HashMap::new();
+    let mut addition_slot: Vec<(u64, u32, u32, u64)> = Vec::new();
+
+    for chunk in &wad.chunks {
+        if let Some(content) = overrides.get(&chunk.path_hash) {
+            let offset = u32::try_from(cursor).map_err(|_| WadV3Error::Truncated)?;
+            let size = u32::try_from(content.len()).map_err(|_| WadV3Error::Truncated)?;
+            override_slot.insert(chunk.path_hash, (offset, size, xxh3_64(content)));
+            appended.extend_from_slice(content);
+            cursor += content.len() as u64;
+        }
+    }
+    for (hash, content) in &additions {
+        let offset = u32::try_from(cursor).map_err(|_| WadV3Error::Truncated)?;
+        let size = u32::try_from(content.len()).map_err(|_| WadV3Error::Truncated)?;
+        addition_slot.push((*hash, offset, size, xxh3_64(content)));
+        appended.extend_from_slice(content);
+        cursor += content.len() as u64;
+    }
+
+    // Rewrite the original entries: overridden ones repoint to the appended payload
+    // as Raw; untouched ones copy verbatim with their offset re-based by `delta`.
+    for (index, chunk) in wad.chunks.iter().enumerate() {
+        let base = HEADER_LEN + index * ENTRY_LEN;
+        if let Some((offset, size, checksum)) = override_slot.get(&chunk.path_hash) {
+            write_raw_entry(&mut out, base, chunk.path_hash, *offset, *size, *checksum);
+        } else {
+            let src = HEADER_LEN + index * ENTRY_LEN;
+            out[base..base + ENTRY_LEN].copy_from_slice(&original[src..src + ENTRY_LEN]);
+            let rebased = chunk.data_offset.checked_add(delta).ok_or(WadV3Error::Truncated)?;
+            out[base + 8..base + 12].copy_from_slice(&rebased.to_le_bytes());
+        }
+    }
+    // Append the new entries' table slots after the original ones.
+    for (slot, (hash, offset, size, checksum)) in addition_slot.iter().enumerate() {
+        let base = HEADER_LEN + (original_count + slot) * ENTRY_LEN;
+        write_raw_entry(&mut out, base, *hash, *offset, *size, *checksum);
+    }
+
+    out.extend_from_slice(&appended);
+    Ok(out)
+}
+
+/// Write a 32-byte table entry for a `Raw`, single-chunk payload.
+fn write_raw_entry(out: &mut [u8], base: usize, path_hash: u64, offset: u32, size: u32, checksum: u64) {
+    out[base..base + 8].copy_from_slice(&path_hash.to_le_bytes());
+    out[base + 8..base + 12].copy_from_slice(&offset.to_le_bytes()); // dataOffset
+    out[base + 12..base + 16].copy_from_slice(&size.to_le_bytes()); // compressedSize
+    out[base + 16..base + 20].copy_from_slice(&size.to_le_bytes()); // uncompressedSize
+    out[base + 20] = 0; // compression type Raw, 0 subchunks
+    out[base + 21] = 0; // not duplicated
+    out[base + 22..base + 24].copy_from_slice(&0u16.to_le_bytes()); // subchunkStart
+    out[base + 24..base + 32].copy_from_slice(&checksum.to_le_bytes()); // checksum
+}
+
 fn read_u16(bytes: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([bytes[at], bytes[at + 1]])
 }
@@ -332,6 +439,54 @@ mod tests {
         let original = build_v3(&[("data/only.bin", b"x")]);
         let err = patch_wad(&original, &[(path_hash("data/missing.bin"), b"y")]).unwrap_err();
         assert!(matches!(err, WadV3Error::ChunkNotFound(_)));
+    }
+
+    #[test]
+    fn patch_or_add_overrides_existing_and_appends_new() {
+        let original = build_v3(&[
+            ("data/keep.bin", b"original-keep"),
+            ("data/swap.bin", b"original-swap"),
+        ]);
+
+        let swapped_payload = b"a much longer replacement payload than before";
+        let added_payload = b"brand new asset bytes";
+        let patched = patch_or_add_wad(
+            &original,
+            &[
+                (path_hash("data/swap.bin"), swapped_payload),
+                (path_hash("data/added.bin"), added_payload),
+            ],
+        )
+        .unwrap();
+
+        let wad = WadV3::parse(&patched).unwrap();
+        assert_eq!(wad.chunks.len(), 3);
+
+        // Untouched chunk still decodes to its original bytes after the TOC grew.
+        let kept = wad.find_path("data/keep.bin").unwrap();
+        assert_eq!(decode_chunk(&patched, kept).unwrap(), b"original-keep");
+
+        // Overridden chunk now resolves to the new payload.
+        let swapped = wad.find_path("data/swap.bin").unwrap();
+        assert_eq!(swapped.chunk_type, ChunkType::Raw);
+        assert_eq!(decode_chunk(&patched, swapped).unwrap(), swapped_payload);
+
+        // The brand-new chunk is present and decodes correctly.
+        let added = wad.find_path("data/added.bin").unwrap();
+        assert_eq!(added.chunk_type, ChunkType::Raw);
+        assert_eq!(decode_chunk(&patched, added).unwrap(), added_payload);
+        assert_eq!(added.checksum, xxh3_64(added_payload));
+    }
+
+    #[test]
+    fn patch_or_add_with_only_overrides_matches_patch_wad_semantics() {
+        let original = build_v3(&[("data/a.bin", b"aaaa"), ("data/b.bin", b"bbbb")]);
+        let patched = patch_or_add_wad(&original, &[(path_hash("data/b.bin"), b"BBBB")]).unwrap();
+
+        let wad = WadV3::parse(&patched).unwrap();
+        assert_eq!(wad.chunks.len(), 2);
+        assert_eq!(decode_chunk(&patched, wad.find_path("data/a.bin").unwrap()).unwrap(), b"aaaa");
+        assert_eq!(decode_chunk(&patched, wad.find_path("data/b.bin").unwrap()).unwrap(), b"BBBB");
     }
 
     #[test]
