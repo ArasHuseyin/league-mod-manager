@@ -25,9 +25,11 @@
 //! Compression types: 0 Raw, 1 Gzip, 2 Link, 3 Zstd, 4 ZstdChunked.
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 
 use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use thiserror::Error;
 use xxhash_rust::xxh3::xxh3_64;
 use xxhash_rust::xxh64::xxh64;
@@ -297,35 +299,30 @@ pub fn patch_or_add_wad(original: &[u8], entries: &[(u64, &[u8])]) -> Result<Vec
     out.extend_from_slice(original_payload);
 
     // The appended region begins right after the shifted original payload. Lay out
-    // every overridden and added payload there and remember each absolute offset.
+    // every overridden and added payload there, Gzip-compressing whatever shrinks,
+    // and remember each entry's on-disk layout.
     let mut appended: Vec<u8> = Vec::new();
     let mut cursor = out.len() as u64;
-    let mut override_slot: HashMap<u64, (u32, u32, u64)> = HashMap::new();
-    let mut addition_slot: Vec<(u64, u32, u32, u64)> = Vec::new();
+    let mut override_slot: HashMap<u64, EntrySlot> = HashMap::new();
+    let mut addition_slot: Vec<(u64, EntrySlot)> = Vec::new();
 
     for chunk in &wad.chunks {
         if let Some(content) = overrides.get(&chunk.path_hash) {
-            let offset = u32::try_from(cursor).map_err(|_| WadV3Error::Truncated)?;
-            let size = u32::try_from(content.len()).map_err(|_| WadV3Error::Truncated)?;
-            override_slot.insert(chunk.path_hash, (offset, size, xxh3_64(content)));
-            appended.extend_from_slice(content);
-            cursor += content.len() as u64;
+            let slot = encode_into(&mut appended, &mut cursor, content)?;
+            override_slot.insert(chunk.path_hash, slot);
         }
     }
     for (hash, content) in &additions {
-        let offset = u32::try_from(cursor).map_err(|_| WadV3Error::Truncated)?;
-        let size = u32::try_from(content.len()).map_err(|_| WadV3Error::Truncated)?;
-        addition_slot.push((*hash, offset, size, xxh3_64(content)));
-        appended.extend_from_slice(content);
-        cursor += content.len() as u64;
+        let slot = encode_into(&mut appended, &mut cursor, content)?;
+        addition_slot.push((*hash, slot));
     }
 
-    // Rewrite the original entries: overridden ones repoint to the appended payload
-    // as Raw; untouched ones copy verbatim with their offset re-based by `delta`.
+    // Rewrite the original entries: overridden ones repoint to the appended payload;
+    // untouched ones copy verbatim with their offset re-based by `delta`.
     for (index, chunk) in wad.chunks.iter().enumerate() {
         let base = HEADER_LEN + index * ENTRY_LEN;
-        if let Some((offset, size, checksum)) = override_slot.get(&chunk.path_hash) {
-            write_raw_entry(&mut out, base, chunk.path_hash, *offset, *size, *checksum);
+        if let Some(slot) = override_slot.get(&chunk.path_hash) {
+            write_entry(&mut out, base, chunk.path_hash, slot);
         } else {
             let src = HEADER_LEN + index * ENTRY_LEN;
             out[base..base + ENTRY_LEN].copy_from_slice(&original[src..src + ENTRY_LEN]);
@@ -334,25 +331,69 @@ pub fn patch_or_add_wad(original: &[u8], entries: &[(u64, &[u8])]) -> Result<Vec
         }
     }
     // Append the new entries' table slots after the original ones.
-    for (slot, (hash, offset, size, checksum)) in addition_slot.iter().enumerate() {
-        let base = HEADER_LEN + (original_count + slot) * ENTRY_LEN;
-        write_raw_entry(&mut out, base, *hash, *offset, *size, *checksum);
+    for (slot_index, (hash, slot)) in addition_slot.iter().enumerate() {
+        let base = HEADER_LEN + (original_count + slot_index) * ENTRY_LEN;
+        write_entry(&mut out, base, *hash, slot);
     }
 
     out.extend_from_slice(&appended);
     Ok(out)
 }
 
-/// Write a 32-byte table entry for a `Raw`, single-chunk payload.
-fn write_raw_entry(out: &mut [u8], base: usize, path_hash: u64, offset: u32, size: u32, checksum: u64) {
+/// On-disk layout of one appended payload.
+struct EntrySlot {
+    offset: u32,
+    compressed_size: u32,
+    uncompressed_size: u32,
+    chunk_type: u8,
+    checksum: u64,
+}
+
+/// Encode `content` into the appended region (Gzip when it shrinks, else Raw),
+/// advance `cursor`, and return the resulting slot. The checksum is XXH3-64 of
+/// the on-disk bytes, matching how the format keys chunk integrity.
+fn encode_into(appended: &mut Vec<u8>, cursor: &mut u64, content: &[u8]) -> Result<EntrySlot, WadV3Error> {
+    let (chunk_type, on_disk) = encode_payload(content);
+    let offset = u32::try_from(*cursor).map_err(|_| WadV3Error::Truncated)?;
+    let compressed_size = u32::try_from(on_disk.len()).map_err(|_| WadV3Error::Truncated)?;
+    let uncompressed_size = u32::try_from(content.len()).map_err(|_| WadV3Error::Truncated)?;
+    let checksum = xxh3_64(&on_disk);
+    appended.extend_from_slice(&on_disk);
+    *cursor += on_disk.len() as u64;
+    Ok(EntrySlot {
+        offset,
+        compressed_size,
+        uncompressed_size,
+        chunk_type,
+        checksum,
+    })
+}
+
+/// Gzip-compress `content`, returning `(ChunkType::Gzip, bytes)` only when the
+/// result is smaller than the input; otherwise store it `(Raw, bytes)`. Both
+/// types are ones the game decodes natively.
+fn encode_payload(content: &[u8]) -> (u8, Vec<u8>) {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    if encoder.write_all(content).is_ok() {
+        if let Ok(compressed) = encoder.finish() {
+            if compressed.len() < content.len() {
+                return (1, compressed); // ChunkType::Gzip
+            }
+        }
+    }
+    (0, content.to_vec()) // ChunkType::Raw
+}
+
+/// Write a 32-byte table entry for a single-chunk (non-subchunked) payload.
+fn write_entry(out: &mut [u8], base: usize, path_hash: u64, slot: &EntrySlot) {
     out[base..base + 8].copy_from_slice(&path_hash.to_le_bytes());
-    out[base + 8..base + 12].copy_from_slice(&offset.to_le_bytes()); // dataOffset
-    out[base + 12..base + 16].copy_from_slice(&size.to_le_bytes()); // compressedSize
-    out[base + 16..base + 20].copy_from_slice(&size.to_le_bytes()); // uncompressedSize
-    out[base + 20] = 0; // compression type Raw, 0 subchunks
+    out[base + 8..base + 12].copy_from_slice(&slot.offset.to_le_bytes()); // dataOffset
+    out[base + 12..base + 16].copy_from_slice(&slot.compressed_size.to_le_bytes());
+    out[base + 16..base + 20].copy_from_slice(&slot.uncompressed_size.to_le_bytes());
+    out[base + 20] = slot.chunk_type; // low nibble = compression, high nibble = 0 subchunks
     out[base + 21] = 0; // not duplicated
     out[base + 22..base + 24].copy_from_slice(&0u16.to_le_bytes()); // subchunkStart
-    out[base + 24..base + 32].copy_from_slice(&checksum.to_le_bytes()); // checksum
+    out[base + 24..base + 32].copy_from_slice(&slot.checksum.to_le_bytes()); // checksum
 }
 
 fn read_u16(bytes: &[u8], at: usize) -> u16 {
@@ -476,6 +517,22 @@ mod tests {
         assert_eq!(added.chunk_type, ChunkType::Raw);
         assert_eq!(decode_chunk(&patched, added).unwrap(), added_payload);
         assert_eq!(added.checksum, xxh3_64(added_payload));
+    }
+
+    #[test]
+    fn patch_or_add_compresses_large_payloads_and_round_trips() {
+        let original = build_v3(&[("data/swap.bin", b"x")]);
+        // Highly compressible payload, well above the gzip break-even point.
+        let payload = vec![b'A'; 8192];
+        let patched =
+            patch_or_add_wad(&original, &[(path_hash("data/swap.bin"), &payload)]).unwrap();
+
+        let wad = WadV3::parse(&patched).unwrap();
+        let chunk = wad.find_path("data/swap.bin").unwrap();
+        assert_eq!(chunk.chunk_type, ChunkType::Gzip);
+        assert!((chunk.compressed_size as usize) < payload.len());
+        assert_eq!(chunk.uncompressed_size as usize, payload.len());
+        assert_eq!(decode_chunk(&patched, chunk).unwrap(), payload);
     }
 
     #[test]

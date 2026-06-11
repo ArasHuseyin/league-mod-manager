@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { api } from "./api";
 import type {
   ApplyReport,
+  InjectorResult,
   LeagueInstallation,
   LibraryItem,
   PatchReport,
@@ -19,6 +20,8 @@ type AppState = {
   leagueRoot: string;
   lastPatchReport?: PatchReport;
   lastApplyReport?: ApplyReport;
+  injectorResult?: InjectorResult;
+  elevated: boolean;
   logLines: string[];
   loading: boolean;
   applying: boolean;
@@ -31,8 +34,11 @@ type AppState = {
   createProfile: (name: string) => Promise<void>;
   importMod: (path: string) => Promise<void>;
   setProfileModEnabled: (modId: string, enabled: boolean) => Promise<void>;
+  reorderMod: (modId: string, up: boolean) => Promise<void>;
   runDryPatch: () => Promise<void>;
   runApplyPatch: () => Promise<void>;
+  clearMods: () => Promise<void>;
+  setInjectorResult: (result: InjectorResult) => void;
   selectAndSetLeagueRoot: () => Promise<void>;
   selectAndImportMod: () => Promise<void>;
   selectAndImportModDir: () => Promise<void>;
@@ -44,6 +50,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   profiles: [],
   installations: [],
   leagueRoot: "",
+  elevated: true,
   logLines: ["App shell initialized."],
   loading: false,
   applying: false,
@@ -53,15 +60,17 @@ export const useAppStore = create<AppState>((set, get) => ({
   load: async () => {
     set({ loading: true, error: undefined });
     try {
-      const [library, profiles, installations] = await Promise.all([
+      const [library, profiles, installations, elevated] = await Promise.all([
         api.getLibrary(),
         api.getProfiles(),
         api.detectLeague(),
+        api.checkElevation(),
       ]);
       set({
         library,
         profiles,
         installations,
+        elevated,
         selectedProfileId: profiles[0]?.id,
         leagueRoot: installations[0]?.root ?? "",
         loading: false,
@@ -179,22 +188,55 @@ export const useAppStore = create<AppState>((set, get) => ({
       return;
     }
 
-    set({ applying: true, error: undefined });
+    set({ applying: true, error: undefined, injectorResult: undefined });
     try {
       const report = await api.applyPatch(selectedProfileId, leagueRoot);
       set({
         applying: false,
         lastApplyReport: report,
+        elevated: report.elevated,
         activeTab: "jobs",
         logLines: [
           ...get().logLines,
           report.injectorStarted
-            ? `Applied ${report.stagedFiles.length} file(s) with ${report.redirectionCount} redirection(s); injector watching for ${report.processName}.`
+            ? `Applied ${report.stagedFiles.length} file(s) (${report.matchedOverrides} matched, ${report.addedEntries} added) with ${report.redirectionCount} redirection(s); injector watching for ${report.processName}.`
             : `Apply finished with status ${report.status}: ${report.messages.join(" ")}`,
         ],
       });
     } catch (error) {
       set({ applying: false, error: String(error) });
+    }
+  },
+  clearMods: async () => {
+    try {
+      const message = await api.clearMods();
+      set({
+        lastApplyReport: undefined,
+        injectorResult: undefined,
+        logLines: [...get().logLines, message],
+      });
+    } catch (error) {
+      set({ error: String(error) });
+    }
+  },
+  setInjectorResult: (result) =>
+    set({
+      injectorResult: result,
+      logLines: [...get().logLines, result.message],
+    }),
+  reorderMod: async (modId, up) => {
+    const { selectedProfileId, profiles } = get();
+    if (!selectedProfileId) {
+      set({ error: "Select a profile before reordering mods." });
+      return;
+    }
+    try {
+      const updated = await api.reorderProfileMod(selectedProfileId, modId, up);
+      set({
+        profiles: profiles.map((profile) => (profile.id === updated.id ? updated : profile)),
+      });
+    } catch (error) {
+      set({ error: String(error) });
     }
   },
   selectAndSetLeagueRoot: async () => {

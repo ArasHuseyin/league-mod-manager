@@ -4,6 +4,8 @@ import { listen } from "@tauri-apps/api/event";
 import {
   AlertTriangle,
   Boxes,
+  ChevronDown,
+  ChevronUp,
   FileArchive,
   FolderSearch,
   Hammer,
@@ -14,6 +16,7 @@ import {
   ScrollText,
   Settings,
   ShieldAlert,
+  Square,
   UserRoundCog,
 } from "lucide-react";
 import { useAppStore } from "./store";
@@ -34,10 +37,13 @@ function App() {
     error,
     loading,
     applying,
+    elevated,
     load,
     setTab,
     runDryPatch,
     runApplyPatch,
+    clearMods,
+    setInjectorResult,
     library,
     profiles,
     selectedProfileId,
@@ -52,6 +58,22 @@ function App() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<{ success: boolean; message: string }>("injector-result", (event) => {
+      setInjectorResult(event.payload);
+    })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch((err) => console.warn("injector-result listener failed:", err));
+    return () => {
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [setInjectorResult]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -130,6 +152,15 @@ function App() {
               {loading ? "Patching..." : "Dry patch"}
             </button>
             <button
+              className="secondary"
+              onClick={() => void clearMods()}
+              disabled={loading || applying}
+              title="Stop the injector and clear staged mods"
+            >
+              <Square size={17} />
+              Stop &amp; clear
+            </button>
+            <button
               className="primary"
               onClick={() => setConfirmOpen(true)}
               disabled={loading || applying}
@@ -148,6 +179,16 @@ function App() {
               void runApplyPatch();
             }}
           />
+        ) : null}
+
+        {!elevated ? (
+          <div className="banner">
+            <ShieldAlert size={18} />
+            <span>
+              Not running as Administrator — injecting into the game will likely be denied.
+              Restart this app as Administrator.
+            </span>
+          </div>
         ) : null}
 
         {error ? (
@@ -294,10 +335,16 @@ function ProfilesView() {
     selectedProfileId,
     setSelectedProfile,
     setProfileModEnabled,
+    reorderMod,
     createProfile,
   } = useAppStore();
   const [name, setName] = React.useState("");
   const activeProfile = profiles.find((profile) => profile.id === selectedProfileId);
+  const modById = new Map(library.map((item) => [item.manifest.id, item]));
+  // Enabled mods in load order; later entries win when two write the same asset.
+  const orderedEnabled = (activeProfile?.modOrder ?? []).filter((id) =>
+    activeProfile?.enabledMods.includes(id),
+  );
   return (
     <section className="split">
       <div className="panel">
@@ -353,6 +400,45 @@ function ProfilesView() {
             </div>
           ))}
         </div>
+        {orderedEnabled.length > 1 ? (
+          <>
+            <h2>Load order</h2>
+            <p className="hint">Later mods win when two change the same asset.</p>
+            <div className="stack">
+              {orderedEnabled.map((id, index) => {
+                const item = modById.get(id);
+                return (
+                  <div className="list-row" key={id}>
+                    <div>
+                      <strong>
+                        {index + 1}. {item?.manifest.name ?? id}
+                      </strong>
+                      <span>{item?.manifest.assets[0]?.wad ?? "No WAD target"}</span>
+                    </div>
+                    <div className="order-buttons">
+                      <button
+                        className="secondary"
+                        onClick={() => void reorderMod(id, true)}
+                        disabled={index === 0}
+                        title="Move earlier (loses on overlap)"
+                      >
+                        <ChevronUp size={16} />
+                      </button>
+                      <button
+                        className="secondary"
+                        onClick={() => void reorderMod(id, false)}
+                        disabled={index === orderedEnabled.length - 1}
+                        title="Move later (wins on overlap)"
+                      >
+                        <ChevronDown size={16} />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        ) : null}
       </div>
     </section>
   );
@@ -382,7 +468,7 @@ function WorkshopView() {
 }
 
 function JobsView() {
-  const { lastPatchReport, lastApplyReport } = useAppStore();
+  const { lastPatchReport, lastApplyReport, injectorResult } = useAppStore();
   return (
     <section className="panel">
       {lastApplyReport ? (
@@ -394,18 +480,42 @@ function JobsView() {
               <span>Status</span>
             </div>
             <div>
-              <strong>{lastApplyReport.stagedFiles.length}</strong>
-              <span>Staged files</span>
+              <strong>{lastApplyReport.matchedOverrides}</strong>
+              <span>Matched overrides</span>
+            </div>
+            <div>
+              <strong>{lastApplyReport.addedEntries}</strong>
+              <span>Added (no match)</span>
             </div>
             <div>
               <strong>{lastApplyReport.redirectionCount}</strong>
               <span>Redirections</span>
             </div>
             <div>
-              <strong>{lastApplyReport.injectorStarted ? "armed" : "idle"}</strong>
+              <strong>
+                {injectorResult
+                  ? injectorResult.success
+                    ? "injected"
+                    : "failed"
+                  : lastApplyReport.injectorStarted
+                    ? "armed"
+                    : "idle"}
+              </strong>
               <span>Injector</span>
             </div>
           </div>
+          {injectorResult ? (
+            <p className={injectorResult.success ? "result-ok" : "modal-warning"}>
+              {injectorResult.message}
+            </p>
+          ) : null}
+          {lastApplyReport.addedEntries > 0 ? (
+            <p className="modal-warning">
+              {lastApplyReport.addedEntries} override(s) did not match an existing asset and were
+              appended as new entries — those target paths are likely wrong and will have no effect
+              in game.
+            </p>
+          ) : null}
           {lastApplyReport.messages.map((message) => (
             <p key={message}>{message}</p>
           ))}

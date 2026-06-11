@@ -43,7 +43,7 @@ The repository is a Cargo + pnpm workspace.
 | Crate / package | Role |
 | --- | --- |
 | `crates/manager-core` | Manifests, profiles, validation, policy warnings, League path discovery, patch planning, and persisted state. |
-| `crates/manager-patcher` | WAD codecs and the patch engine. `league_wad` reads and patches real League WAD v3 archives (`patch_or_add_wad` overrides existing chunks and appends new ones); `wad` is a self-contained teaching codec used in tests. `PatchEngine::stage` produces the patched archives and `redirections.json`. |
+| `crates/manager-patcher` | The WAD codec and patch engine. `league_wad` reads and patches real League WAD v3 archives (`patch_or_add_wad` overrides existing chunks and appends new ones, Gzip-compressing what shrinks). `PatchEngine::stage` produces the patched archives and `redirections.json`, and reports which overrides matched real assets. |
 | `crates/manager-injector` | Finds the game process and injects a DLL (`CreateRemoteThread` + `LoadLibraryW`). Usable as a library or a CLI. |
 | `crates/manager-hook-dll` | The injected `cdylib`. Reads `redirections.json` from its own directory and hooks `CreateFileW` to redirect WAD opens. |
 | `crates/manager-cli` | Developer CLI for validation, import checks, patch dry-runs, staging, and diagnostics. |
@@ -79,11 +79,25 @@ variables.
 1. **Settings** — set or auto-detect your League installation path.
 2. **Library** — import mods (folders with a `manifest.json`, or legacy
    `.fantome` / `.modpkg` archives; drag-and-drop is supported).
-3. **Profiles** — create a profile and enable the mods you want.
-4. **Dry patch** — preview the patch plan and surface any conflicts without
+3. **Profiles** — create a profile, enable the mods you want, and set their
+   **load order**. When two enabled mods change the same asset, the one later in
+   the order wins (no hard conflict); use the up/down arrows to choose.
+4. **Dry patch** — preview the patch plan and surface overlap warnings without
    writing anything.
 5. **Apply & inject** — stage the patched WADs, arm the injector, then launch
    League (or the Practice Tool). Results appear under **Jobs**.
+6. **Stop & clear** — disarm the injector and clear staged output. A hook already
+   loaded into a running game keeps its redirects until you restart the game.
+
+> [!IMPORTANT]
+> Run the app **as Administrator** — injecting into the game requires it, and the
+> app warns when it is not elevated.
+
+The **Jobs** view reports how many overrides actually *matched* an existing game
+asset versus how many were *appended as new entries*. A non-zero "added" count
+usually means a mod declared wrong target paths and that override will have no
+visible effect — the first thing to check when a mod "does nothing". Once the
+game starts, the injector reports back whether injection actually succeeded.
 
 ## CLI
 
@@ -117,5 +131,5 @@ this model on import.
 - The League installation is never modified; all output goes to a staging
   folder and the game is redirected to it at runtime.
 - The patcher does not touch, bypass, or tamper with anti-cheat.
-- Conflicting patch plans (two enabled mods targeting the same asset) are
-  refused, and nothing is staged or injected.
+- When two enabled mods target the same asset, the overlap is resolved by load
+  order (later wins) and reported as a warning, not silently merged.

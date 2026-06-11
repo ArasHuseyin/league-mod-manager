@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust-tests:
+    name: Rust tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test portable crates
+        # The injector, hook DLL and Tauri shell are Windows-targeted; those are
+        # built and tested in the windows-build job below.
+        run: cargo test -p manager-core -p manager-patcher -p manager-cli
+
+  frontend:
+    name: Frontend (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Type-check and build
+        run: pnpm --filter @league-mod-manager/desktop run build
+      - name: Unit tests
+        run: pnpm --filter @league-mod-manager/desktop run test
+
+  windows-build:
+    name: Windows build + tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # generate_context! embeds the built frontend, so build it before the crates.
+      - name: Build frontend
+        run: pnpm --filter @league-mod-manager/desktop run build
+      # Compiles the Windows-only crates (injector, hook DLL, elevation FFI) and
+      # the desktop shell — the combination that cannot be verified on Linux.
+      - name: Build workspace
+        run: cargo build --workspace
+      - name: Test workspace
+        run: cargo test --workspace

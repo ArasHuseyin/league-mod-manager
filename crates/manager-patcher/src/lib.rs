@@ -1,5 +1,4 @@
 pub mod league_wad;
-pub mod wad;
 
 use manager_core::{
     build_patch_plan, read_package_asset, LibraryItem, ModId, PatchOperation, PatchPlan, Profile,
@@ -51,6 +50,13 @@ pub struct StagedWad {
     pub wad: String,
     pub output_path: PathBuf,
     pub entry_count: usize,
+    /// How many of this WAD's overrides matched an asset that already exists in
+    /// the real archive (a genuine replacement the game will load).
+    pub matched_overrides: usize,
+    /// How many were appended as brand-new entries because their target path
+    /// hashed to nothing in the archive. A non-zero count usually means the
+    /// mod's target paths are wrong and the override will have no visible effect.
+    pub added_entries: usize,
 }
 
 /// Result of staging a profile's active mods into overlay WADs.
@@ -69,8 +75,6 @@ pub enum PatchError {
     MissingLeagueRoot(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("wad error: {0}")]
-    Wad(#[from] wad::WadError),
     #[error("failed to stage overlay: {0}")]
     Stage(String),
 }
@@ -191,6 +195,8 @@ impl PatchEngine {
                         wad: RAW_WAD.to_string(),
                         output_path,
                         entry_count: 1,
+                        matched_overrides: 1,
+                        added_entries: 0,
                     });
                 }
                 continue;
@@ -217,6 +223,19 @@ impl PatchEngine {
                 .map(|(hash, bytes)| (*hash, bytes.as_slice()))
                 .collect();
 
+            // Classify each override against the real archive so we can report
+            // which targets truly replace an asset and which silently became
+            // additions (a sign of a wrong target path in the mod).
+            let parsed = league_wad::WadV3::parse(&original)
+                .map_err(|error| PatchError::Stage(format!("{wad}: {error}")))?;
+            let existing: std::collections::HashSet<u64> =
+                parsed.chunks.iter().map(|chunk| chunk.path_hash).collect();
+            let matched_overrides = overrides
+                .iter()
+                .filter(|(hash, _)| existing.contains(hash))
+                .count();
+            let added_entries = overrides.len() - matched_overrides;
+
             let patched = league_wad::patch_or_add_wad(&original, &overrides)
                 .map_err(|error| PatchError::Stage(format!("{wad}: {error}")))?;
 
@@ -225,10 +244,20 @@ impl PatchEngine {
 
             redirections.insert(redirect_key(&request.league_root, &real_wad), absolute_string(&output_path));
 
+            if added_entries > 0 {
+                messages.push(format!(
+                    "{wad}: {added_entries} of {} override(s) did not match an existing asset and were \
+                     appended as new entries; the mod's target paths for those may be wrong.",
+                    overrides.len()
+                ));
+            }
+
             staged.push(StagedWad {
                 wad,
                 output_path,
                 entry_count: operations.len(),
+                matched_overrides,
+                added_entries,
             });
         }
 
@@ -428,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_targets_block_the_patch() {
+    fn overlapping_targets_resolve_to_a_ready_plan() {
         let dir = tempfile::tempdir().unwrap();
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
@@ -443,8 +472,11 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(report.status, PatchStatus::Blocked);
-        assert_eq!(report.plan.conflicts.len(), 1);
+        // Overlaps are resolved by load order, not blocked.
+        assert_eq!(report.status, PatchStatus::Ready);
+        assert!(report.plan.conflicts.is_empty());
+        assert_eq!(report.plan.operations.len(), 1);
+        assert_eq!(report.plan.warnings.len(), 1);
     }
 
     #[test]
@@ -579,6 +611,74 @@ mod tests {
     }
 
     #[test]
+    fn stage_reports_matched_and_added_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        // Real archive contains only "hit.bin"; the mod overrides it (a hit) and
+        // also targets "miss.bin" which the archive lacks (an addition).
+        let real_wad = build_real_wad(&[("data/hit.bin", b"original")]);
+        let wad_dir = dir.path().join("Game/DATA/FINAL/Champions");
+        std::fs::create_dir_all(&wad_dir).unwrap();
+        std::fs::write(wad_dir.join("Aatrox.wad.client"), &real_wad).unwrap();
+
+        let package = dir.path().join("pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("hit.bin"), b"new-hit").unwrap();
+        std::fs::write(package.join("miss.bin"), b"new-miss").unwrap();
+
+        let id = Uuid::new_v4();
+        let item = LibraryItem {
+            manifest: ModManifest {
+                schema_version: 1,
+                id,
+                name: "Mixed".to_string(),
+                version: "1.0.0".to_string(),
+                author: "tester".to_string(),
+                description: String::new(),
+                tags: Vec::new(),
+                preview_image: None,
+                assets: vec![
+                    ModAsset {
+                        source: "hit.bin".to_string(),
+                        target: "data/hit.bin".to_string(),
+                        wad: "Characters/Aatrox.wad.client".to_string(),
+                        layer: None,
+                        sha256: None,
+                    },
+                    ModAsset {
+                        source: "miss.bin".to_string(),
+                        target: "data/miss.bin".to_string(),
+                        wad: "Characters/Aatrox.wad.client".to_string(),
+                        layer: None,
+                        sha256: None,
+                    },
+                ],
+            },
+            package_path: package,
+            imported_at: OffsetDateTime::UNIX_EPOCH,
+        };
+
+        let staging = dir.path().join("staging");
+        let report = PatchEngine::stage(
+            &PatchRequest {
+                league_root: dir.path().to_path_buf(),
+                dry_run: true,
+                profile: profile_with(&[id]),
+                library: vec![item],
+            },
+            &staging,
+        )
+        .unwrap();
+
+        let staged = &report.staged[0];
+        assert_eq!(staged.matched_overrides, 1);
+        assert_eq!(staged.added_entries, 1);
+        assert!(report
+            .messages
+            .iter()
+            .any(|message| message.contains("did not match an existing asset")));
+    }
+
+    #[test]
     fn find_game_wad_prefers_data_final_and_is_deterministic() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -648,28 +748,64 @@ mod tests {
     }
 
     #[test]
-    fn stage_refuses_conflicting_plans() {
+    fn stage_resolves_overlapping_mods_to_the_load_order_winner() {
         let dir = tempfile::tempdir().unwrap();
-        let staging = dir.path().join("staging");
+        let target = "data/shared.bin";
+        let real_wad = build_real_wad(&[(target, b"original")]);
+        let wad_dir = dir.path().join("Game/DATA/FINAL/Champions");
+        std::fs::create_dir_all(&wad_dir).unwrap();
+        std::fs::write(wad_dir.join("Aatrox.wad.client"), &real_wad).unwrap();
+
+        let make_item = |id: Uuid, body: &[u8]| {
+            let package = dir.path().join(id.to_string());
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(package.join("asset.bin"), body).unwrap();
+            LibraryItem {
+                manifest: ModManifest {
+                    schema_version: 1,
+                    id,
+                    name: format!("Mod {id}"),
+                    version: "1.0.0".to_string(),
+                    author: "tester".to_string(),
+                    description: String::new(),
+                    tags: Vec::new(),
+                    preview_image: None,
+                    assets: vec![ModAsset {
+                        source: "asset.bin".to_string(),
+                        target: target.to_string(),
+                        wad: "Characters/Aatrox.wad.client".to_string(),
+                        layer: None,
+                        sha256: None,
+                    }],
+                },
+                package_path: package,
+                imported_at: OffsetDateTime::UNIX_EPOCH,
+            }
+        };
+
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
-
+        let staging = dir.path().join("staging");
         let report = PatchEngine::stage(
             &PatchRequest {
                 league_root: dir.path().to_path_buf(),
                 dry_run: true,
                 profile: profile_with(&[first, second]),
-                library: vec![
-                    library_item(first, "same.bin"),
-                    library_item(second, "same.bin"),
-                ],
+                library: vec![make_item(first, b"first"), make_item(second, b"second-wins")],
             },
             &staging,
         )
         .unwrap();
 
-        assert_eq!(report.status, PatchStatus::Blocked);
-        assert!(report.staged.is_empty());
-        assert!(!staging.exists());
+        assert_eq!(report.status, PatchStatus::Applied);
+        assert_eq!(report.staged.len(), 1);
+        // Exactly one resolved override, and the later mod's bytes are the ones staged.
+        assert_eq!(report.staged[0].matched_overrides, 1);
+        assert!(report.plan.warnings.iter().any(|warning| warning.contains("overrides")));
+
+        let bytes = std::fs::read(&report.staged[0].output_path).unwrap();
+        let parsed = league_wad::WadV3::parse(&bytes).unwrap();
+        let chunk = parsed.find_path(target).unwrap();
+        assert_eq!(league_wad::decode_chunk(&bytes, chunk).unwrap(), b"second-wins");
     }
 }

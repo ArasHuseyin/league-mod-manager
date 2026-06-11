@@ -92,6 +92,10 @@ export const api = {
     call<PatchReport>("plan_patch", { profileId, leagueRoot }),
   applyPatch: (profileId: string, leagueRoot: string) =>
     call<ApplyReport>("apply_patch", { profileId, leagueRoot }),
+  clearMods: () => call<string>("clear_mods"),
+  checkElevation: () => call<boolean>("check_elevation", undefined, true),
+  reorderProfileMod: (profileId: string, modId: string, up: boolean) =>
+    call<Profile>("reorder_profile_mod", { profileId, modId, up }),
   selectDirectory: () => call<string | null>("select_directory", undefined, null),
   selectFile: () => call<string | null>("select_file", undefined, null),
 };
