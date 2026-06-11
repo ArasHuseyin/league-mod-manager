@@ -5,7 +5,7 @@ use std::path::Path;
 use std::ptr;
 use std::thread;
 use std::time::Duration;
-use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
 };
@@ -93,7 +93,10 @@ pub fn inject_dll(pid: u32, dll_path: &Path) -> Result<()> {
         )
     };
     if process_handle.is_null() {
-        return Err(anyhow!("failed to open target process"));
+        return Err(anyhow!(
+            "failed to open target process ({})",
+            describe_last_error()
+        ));
     }
 
     // Allocate memory inside target process for the DLL path string
@@ -107,8 +110,9 @@ pub fn inject_dll(pid: u32, dll_path: &Path) -> Result<()> {
         )
     };
     if remote_mem.is_null() {
+        let error = describe_last_error();
         unsafe { CloseHandle(process_handle) };
-        return Err(anyhow!("failed to allocate memory in target process"));
+        return Err(anyhow!("failed to allocate memory in target process ({error})"));
     }
 
     // Write the path bytes into target process memory
@@ -197,6 +201,24 @@ pub fn inject_dll(pid: u32, dll_path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Format the last OS error, with a plain-language note for ACCESS_DENIED — the
+/// case that matters here. When `OpenProcess` succeeds but a later memory call is
+/// denied on a game process, the handle has been stripped of rights by a
+/// kernel-mode anti-cheat (or the manager is not elevated); remote injection
+/// cannot proceed in that situation.
+fn describe_last_error() -> String {
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    let code = unsafe { GetLastError() };
+    match code {
+        ERROR_ACCESS_DENIED => {
+            "os error 5: ACCESS_DENIED — the target is a protected process (kernel anti-cheat) \
+             or this app is not running as Administrator"
+                .to_string()
+        }
+        other => format!("os error {other}"),
+    }
 }
 
 /// Helper that watches for a process name and blocks until it is found and successfully injected.
