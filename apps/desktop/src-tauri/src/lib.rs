@@ -3,8 +3,9 @@ use manager_core::{
     AppPaths, LibraryItem, ModAsset, ModManifest, PersistedState, Profile,
 };
 use manager_patcher::{PatchEngine, PatchRequest, PatchStatus};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::{fs, path::PathBuf, sync::Mutex};
+use tauri::Manager;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -23,6 +24,10 @@ struct AppState {
     library: Mutex<Vec<LibraryItem>>,
     profiles: Mutex<Vec<Profile>>,
     paths: Option<AppPaths>,
+    /// The injector spawned by the most recent apply, kept so it can be reaped
+    /// before the next apply and killed on exit — otherwise an injector that is
+    /// still waiting for the game would linger as an orphaned process.
+    injector: Mutex<Option<Child>>,
 }
 
 impl AppState {
@@ -238,14 +243,36 @@ fn apply_patch(
             .to_string()
     })?;
 
-    Command::new(&injector)
+    // Reap any injector from a previous apply that is still watching for the game,
+    // so repeated applies don't pile up orphaned pollers (each would also try to
+    // inject again once the game starts).
+    reap_injector(&state);
+
+    // The injector waits for the game asynchronously, so we cannot block on the
+    // eventual injection result here. Capture its output to a log so a later
+    // failure (e.g. missing Administrator rights → OpenProcess denied) is
+    // diagnosable rather than silent.
+    let log_path = staging_dir.join("injector.log");
+    let log = fs::File::create(&log_path)
+        .map_err(|error| format!("failed to create injector log {}: {error}", log_path.display()))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|error| format!("failed to prepare injector log: {error}"))?;
+
+    let child = Command::new(&injector)
         .arg(GAME_PROCESS)
         .arg(&dll_dst)
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
         .spawn()
         .map_err(|error| format!("failed to start injector: {error}"))?;
+    *state.injector.lock().expect("injector lock") = Some(child);
 
     messages.push(format!(
-        "Injector is watching for {GAME_PROCESS}; launch the game or Practice Tool to apply the mods."
+        "Injector is watching for {GAME_PROCESS}; launch the game or Practice Tool to apply the mods. \
+         Run this app as Administrator, or injection will be denied. \
+         Diagnostics: {}",
+        log_path.display()
     ));
 
     Ok(ApplyReport {
@@ -259,21 +286,43 @@ fn apply_patch(
     })
 }
 
-/// Resolve the staging directory and ensure it starts empty, so stale overlays
-/// or redirections from a previous profile never linger.
+/// Resolve the staging directory and clear stale output from a previous run.
+///
+/// Clearing is best-effort: if the game is running with mods already loaded it
+/// holds the staged WADs and DLL open, and those files cannot be removed on
+/// Windows. That is fine — staging will overwrite what it can, and a locked file
+/// just means that asset is already live. Failing the whole apply merely because
+/// the *cleanup* step hit a locked file would be worse than leaving it.
 fn staging_dir(paths: Option<&AppPaths>) -> Result<PathBuf, String> {
     let base = match paths {
         Some(paths) => paths.cache.clone(),
         None => std::env::temp_dir().join("league-mod-manager"),
     };
     let dir = base.join("overlay");
-    if dir.exists() {
-        fs::remove_dir_all(&dir)
-            .map_err(|error| format!("failed to clear staging dir {}: {error}", dir.display()))?;
-    }
     fs::create_dir_all(&dir)
         .map_err(|error| format!("failed to create staging dir {}: {error}", dir.display()))?;
+
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let _ = if path.is_dir() {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+        }
+    }
     Ok(dir)
+}
+
+/// Kill and reap a previously spawned injector if one is still tracked. A
+/// successful injector has already exited, so `kill` simply errors harmlessly;
+/// one still polling for the game is terminated so it does not linger.
+fn reap_injector(state: &tauri::State<AppState>) {
+    if let Some(mut child) = state.injector.lock().expect("injector lock").take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 /// Count the entries the hook will redirect, for display. Best-effort: a missing
@@ -419,6 +468,7 @@ pub fn run() {
             library: Mutex::new(state.library),
             profiles: Mutex::new(state.profiles),
             paths,
+            injector: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_library,
@@ -432,6 +482,21 @@ pub fn run() {
             select_directory,
             select_file
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running Tauri application")
+        .run(|app_handle, event| {
+            // Don't leave a still-watching injector behind when the app exits.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(mut child) = app_handle
+                    .state::<AppState>()
+                    .injector
+                    .lock()
+                    .expect("injector lock")
+                    .take()
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        });
 }

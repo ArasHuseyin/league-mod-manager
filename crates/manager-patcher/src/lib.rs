@@ -223,14 +223,7 @@ impl PatchEngine {
             let output_path = staging_dir.join(overlay_file_name(&wad));
             fs::write(&output_path, &patched)?;
 
-            // Key the redirection on the archive's path relative to the install
-            // root: that is an unambiguous, path-boundary suffix of whatever
-            // absolute path the game passes to CreateFileW.
-            let key = real_wad
-                .strip_prefix(&request.league_root)
-                .map(normalize_path)
-                .unwrap_or_else(|_| normalize_key(&wad));
-            redirections.insert(key, absolute_string(&output_path));
+            redirections.insert(redirect_key(&request.league_root, &real_wad), absolute_string(&output_path));
 
             staged.push(StagedWad {
                 wad,
@@ -285,12 +278,37 @@ fn absolute_string(path: &Path) -> String {
         .to_string()
 }
 
+/// Build the hook's redirection key for a real archive: its path relative to the
+/// game's `Game` directory, normalized.
+///
+/// The game runs with `Game` as its working directory and opens WADs with paths
+/// rooted there — sometimes absolute (`…/Game/DATA/FINAL/…`), sometimes relative
+/// to it (`DATA/FINAL/…`). A `Game`-relative key is a path-boundary suffix of
+/// *both* forms; an install-root key would carry a leading `game/` segment that
+/// the relative form lacks, so the hook's suffix match would miss it entirely.
+fn redirect_key(league_root: &Path, real_wad: &Path) -> String {
+    let game_dir = league_root.join("Game");
+    real_wad
+        .strip_prefix(&game_dir)
+        .or_else(|_| real_wad.strip_prefix(league_root))
+        .map(normalize_path)
+        .unwrap_or_else(|_| {
+            real_wad
+                .file_name()
+                .map(|name| normalize_key(&name.to_string_lossy()))
+                .unwrap_or_default()
+        })
+}
+
 /// Find a real `.wad.client` archive in a League installation by file name.
 ///
 /// The manifest's `wad` field carries a logical path (e.g.
 /// `Characters/Aatrox.wad.client`) whose folder need not match the on-disk
 /// layout (`Game/DATA/FINAL/Champions/...`), so we match on the final path
-/// component — WAD file names are unique within an install.
+/// component — WAD file names are unique within an install. When several copies
+/// share a name, we pick deterministically and prefer the canonical `DATA/FINAL`
+/// asset tree over any stray copy, so the choice never depends on `read_dir`
+/// ordering.
 fn find_game_wad(league_root: &Path, wad: &str) -> Option<PathBuf> {
     let file_name = wad
         .rsplit(['/', '\\'])
@@ -301,12 +319,26 @@ fn find_game_wad(league_root: &Path, wad: &str) -> Option<PathBuf> {
     // Real archives live under the `Game` subtree; fall back to the whole root.
     let game_dir = league_root.join("Game");
     let search_root = if game_dir.is_dir() { game_dir } else { league_root.to_path_buf() };
-    find_file_named(&search_root, &file_name)
+
+    let mut matches = Vec::new();
+    collect_files_named(&search_root, &file_name, &mut matches);
+
+    matches.sort_by_key(|path| {
+        let normalized = normalize_path(path);
+        // Prefer the canonical asset tree, then the least-nested path, then a
+        // lexical tiebreak so the result is fully deterministic.
+        let outside_final = u8::from(!normalized.contains("/data/final/"));
+        (outside_final, path.components().count(), normalized)
+    });
+    matches.into_iter().next()
 }
 
-/// Depth-first search for a file whose name equals `target` (case-insensitive).
-fn find_file_named(dir: &Path, target: &str) -> Option<PathBuf> {
-    let entries = fs::read_dir(dir).ok()?;
+/// Recursively collect every file under `dir` whose name equals `target`
+/// (case-insensitive).
+fn collect_files_named(dir: &Path, target: &str, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     let mut subdirs = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -318,15 +350,12 @@ fn find_file_named(dir: &Path, target: &str) -> Option<PathBuf> {
             .map(|name| name.eq_ignore_ascii_case(target))
             .unwrap_or(false)
         {
-            return Some(path);
+            out.push(path);
         }
     }
     for subdir in subdirs {
-        if let Some(found) = find_file_named(&subdir, target) {
-            return Some(found);
-        }
+        collect_files_named(&subdir, target, out);
     }
-    None
 }
 
 #[cfg(test)]
@@ -543,8 +572,27 @@ mod tests {
         let map = redirections.as_object().unwrap();
         assert_eq!(map.len(), 1);
         let (key, value) = map.iter().next().unwrap();
-        assert_eq!(key, "game/data/final/champions/aatrox.wad.client");
+        // Keyed relative to `Game` (no leading `game/`) so the hook's suffix match
+        // works whether the game opens an absolute or a Game-relative path.
+        assert_eq!(key, "data/final/champions/aatrox.wad.client");
         assert!(value.as_str().unwrap().ends_with("Characters_Aatrox.wad.client"));
+    }
+
+    #[test]
+    fn find_game_wad_prefers_data_final_and_is_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // The same archive name exists both as a stray copy and in the canonical
+        // DATA/FINAL tree; the canonical one must win regardless of walk order.
+        let stray = root.join("Game/DATA/Menu.wad.client");
+        let canonical = root.join("Game/DATA/FINAL/UI/Menu.wad.client");
+        std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        std::fs::write(&stray, b"stray").unwrap();
+        std::fs::write(&canonical, b"canonical").unwrap();
+
+        let found = find_game_wad(root, "DATA/Menu.wad.client").unwrap();
+        assert_eq!(found, canonical);
     }
 
     #[test]

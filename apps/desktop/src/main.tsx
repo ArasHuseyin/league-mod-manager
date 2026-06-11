@@ -1,4 +1,4 @@
-import React, { useEffect } from "react";
+import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -44,16 +44,10 @@ function App() {
     importMod,
   } = useAppStore();
 
-  const confirmAndApply = () => {
-    const message =
-      "Apply mods and start the injector for League of Legends?\n\n" +
-      "This injects a DLL into the running game to redirect WAD files. " +
-      "Modifying League of Legends violates Riot's Terms of Service and can lead to a ban — " +
-      "including in the Practice Tool. Use at your own risk.";
-    if (window.confirm(message)) {
-      void runApplyPatch();
-    }
-  };
+  // An in-app modal rather than window.confirm: the synchronous browser dialog
+  // is unreliable across Tauri webviews (it can be suppressed and return false
+  // without ever showing), which would silently skip the warning.
+  const [confirmOpen, setConfirmOpen] = useState(false);
 
   useEffect(() => {
     void load();
@@ -135,12 +129,26 @@ function App() {
               {loading ? <span className="spinner" /> : <Play size={17} />}
               {loading ? "Patching..." : "Dry patch"}
             </button>
-            <button className="primary" onClick={confirmAndApply} disabled={loading || applying}>
+            <button
+              className="primary"
+              onClick={() => setConfirmOpen(true)}
+              disabled={loading || applying}
+            >
               {applying ? <span className="spinner" /> : <Rocket size={17} />}
               {applying ? "Applying..." : "Apply & inject"}
             </button>
           </div>
         </header>
+
+        {confirmOpen ? (
+          <ConfirmApplyModal
+            onCancel={() => setConfirmOpen(false)}
+            onConfirm={() => {
+              setConfirmOpen(false);
+              void runApplyPatch();
+            }}
+          />
+        ) : null}
 
         {error ? (
           <div className="banner">
@@ -156,6 +164,42 @@ function App() {
         {activeTab === "settings" && <SettingsView />}
         {activeTab === "logs" && <LogsView />}
       </main>
+    </div>
+  );
+}
+
+function ConfirmApplyModal({
+  onCancel,
+  onConfirm,
+}: {
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="modal-overlay" onClick={onCancel}>
+      <div className="modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-head">
+          <ShieldAlert size={20} />
+          <h2>Apply mods and inject?</h2>
+        </div>
+        <p>
+          This injects a DLL into the running League of Legends game to redirect
+          its WAD files to the patched copies.
+        </p>
+        <p className="modal-warning">
+          Modifying League of Legends violates Riot&apos;s Terms of Service and can
+          lead to a ban — including in the Practice Tool. Use at your own risk.
+        </p>
+        <div className="modal-actions">
+          <button className="secondary" onClick={onCancel}>
+            Cancel
+          </button>
+          <button className="primary" onClick={onConfirm}>
+            <Rocket size={17} />
+            Apply &amp; inject
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
